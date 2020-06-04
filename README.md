@@ -7,6 +7,8 @@ Status: very 'alpha'
 This permits Erlang/OTP applications to use FoundationDB as a backend for
 mnesia tables. It is based on Aeternity's `mnesia_rocksdb` which was based on Klarna's `mnesia_eleveldb`.
 
+Contributions *very* welcome
+
 ## FoundationDB
 
 https://apple.github.io/foundationdb/
