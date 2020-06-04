@@ -15,6 +15,8 @@
 %% specific language governing permissions and limitations
 %% under the License.
 %%----------------------------------------------------------------
+%% Support of FoundationDB:
+%%  Copyright 2020 Leonard Boyce <leonard.boyce@lucidlayer.com>
 
 -module(mnesia_fdb_manager).
 
