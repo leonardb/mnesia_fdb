@@ -1,0 +1,10 @@
+/doc
+/_build
+*.iml
+Mnesia*
+/_checkouts
+/.idea
+*.beam
+*.so
+*.dump
+test.config

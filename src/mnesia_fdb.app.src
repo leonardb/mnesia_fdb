@@ -1,0 +1,11 @@
+{application, mnesia_fdb,
+ [
+  {description, "FoundationDB backend plugin for Mnesia"},
+  {vsn, "0.1"},
+  {modules, [mnesia_fdb, mnesia_fdb_app,
+             mnesia_fdb_manager, mnesia_fdb_sup]},
+  {registered, []},
+  {mod, {mnesia_fdb_app, []}},
+  {env, []},
+  {applications, [kernel, stdlib, erlfdb]}
+ ]}.

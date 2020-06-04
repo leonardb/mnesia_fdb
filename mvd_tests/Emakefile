@@ -1,0 +1,2 @@
+mnesia_fdb_xform.
+{'*', [{parse_transform, mnesia_fdb_xform},debug_info]}.
