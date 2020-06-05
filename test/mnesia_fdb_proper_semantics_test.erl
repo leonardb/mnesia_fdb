@@ -55,6 +55,7 @@ basic_test_() ->
 
 test(N) ->
     setup_mnesia(),
+    %%mnesia:set_debug_level(debug),
     true = proper:quickcheck(?MODULE:prop_seq(), N),
     ok.
 

@@ -22,10 +22,15 @@
 -define(MB, 1024 * 1024).
 -define(GB, 1024 * 1024 * 1024).
 -define(TABLE_PREFIX, <<"tbl_">>).
+-define(DATA_END, <<"~">>).
 -define(MAX_VALUE_SIZE, 92160). %% 90Kb in Bytes
 -define(DATA_PREFIX(T), case T of bag -> <<"b">>; _ -> <<"d">> end).
 -define(IS_DB, {erlfdb_database, _}).
 -define(IS_TX, {erlfdb_transaction, _}).
+-define(IS_FUTURE, {erlfdb_future, _, _}).
+-define(IS_FOLD_FUTURE, {fold_info, _, _}).
+-define(IS_SS, {erlfdb_snapshot, _}).
+-define(GET_TX(SS), element(2, SS)).
 
 -record(conn,
         {
