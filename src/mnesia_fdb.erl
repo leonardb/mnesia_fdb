@@ -34,7 +34,7 @@
 %% ----------------------------------------------------------------------------
 %% EXPORTS
 %% ----------------------------------------------------------------------------
--export([walk_range/6]).
+-export([walk_range/6, iter/5, iter/6, iter_cont/1]).
 %%
 %% CONVENIENCE API
 %%
@@ -1196,6 +1196,24 @@ is_wild(_) ->
     false.
 
 
+-record(iter_st,
+        {
+         db,
+         tx,
+         table_id,
+         type,
+         iter_limit = 0,
+         start_key,
+         start_sel,
+         end_sel,
+         limit,
+         target_bytes,
+         streaming_mode,
+         iteration,
+         snapshot,
+         reverse
+        }).
+
 -record(it_st, {
                 start_key,
                 end_key,
@@ -1223,6 +1241,125 @@ options_to_walk_st(StartKey, EndKey, Options) ->
        snapshot = erlfdb_util:get(Options, snapshot, false),
        reverse = Reverse
       }.
+
+-define(IS_ITERATOR, {cont, #iter_st{}}).
+
+iter_cont(?IS_ITERATOR = Iterator) ->
+    iter_int_(Iterator);
+iter_cont(_) ->
+    '$end_of_table'.
+
+-spec iter(Db :: ?IS_DB, TableId :: binary(), Type :: atom(), StartKey :: any(), Direction :: forward | reverse) ->
+                  '$end_of_table' | ?IS_ITERATOR.
+iter(?IS_DB = Db, TableId, Type, StartKey, Direction) ->
+    iter(?IS_DB = Db, TableId, Type, StartKey, Direction, 1).
+
+iter(?IS_DB = Db, TableId, Type, StartKey, Direction, IterLimit) ->
+    Tx = erlfdb:create_transaction(Db),
+    Reverse = iter_fwd_rev_(Direction),
+    {SKey, EKey} = iter_start_end_(Reverse, TableId, Type, StartKey),
+    St = #iter_st{
+            db = Db,
+            tx = Tx,
+            table_id = TableId,
+            type = Type,
+            iter_limit = IterLimit,
+            start_key = SKey,
+            start_sel = erlfdb_key:to_selector(SKey),
+            end_sel = erlfdb_key:to_selector(EKey),
+            limit = 0,
+            target_bytes = 0,
+            streaming_mode = iterator,
+            iteration = 1,
+            snapshot = false,
+            reverse = Reverse
+           },
+    iter_int_({cont, St}).
+
+iter_int_({cont, #iter_st{start_sel = StartSel, end_sel = EndSel,
+                          reverse = Reverse, table_id = TableId,
+                          iter_limit = IterLimit, iteration = Iteration} = St0}) ->
+    {{RawRows, Count, HasMore}, St} = iter_future_(St0),
+    case Count of
+        0 ->
+            io:format("end0: ~p~n", [Iteration]),
+            '$end_of_table';
+        _ ->
+            %%io:format("{RawRows: ~p, _Count: ~p, HasMore: ~p}~n", [RawRows, _Count, HasMore]),
+            LastKey = element(1, hd(RawRows)),
+            %% io:format("LastKey [~p]: ~p~n", [length(RawRows), LastKey]),
+            {NStartSel, NEndSel} = iter_sel_(Reverse, StartSel, EndSel, LastKey),
+            DecodedKey = mnesia_fdb_lib:decode_key(LastKey, TableId),
+            HitLimit = iter_limit_(Iteration, IterLimit),
+            %% io:format("HitLimit: ~p~n", [HitLimit]),
+            Done = RawRows =:= [] orelse HitLimit =:= true orelse (HitLimit =:= false andalso not HasMore),
+            %% io:format("Done: ~p~n", [Done]),
+            case Done of
+                true ->
+                    %% io:format("end: ~p~n", [Iteration]),
+                    {DecodedKey, '$end_of_table'};
+                false ->
+                    %% io:format("step: ~p~n", [Iteration+1]),
+                    NSt = St#iter_st{
+                            start_key = DecodedKey,
+                            start_sel = NStartSel,
+                            end_sel = NEndSel,
+                            iteration = Iteration + 1
+                           },
+                    {DecodedKey, {cont, NSt}}
+            end
+    end.
+
+iter_future_(#iter_st{db = Db, tx = Tx, start_sel = StartKey,
+                      end_sel = EndKey, limit = Limit,
+                      target_bytes = TargetBytes, streaming_mode = StreamingMode,
+                      iteration = Iteration, snapshot = Snapshot,
+                      reverse = Reverse} = St) ->
+    try erlfdb:wait(erlfdb_nif:transaction_get_range(
+                      Tx,
+                      StartKey,
+                      EndKey,
+                      Limit,
+                      TargetBytes,
+                      StreamingMode,
+                      Iteration,
+                      Snapshot,
+                      Reverse
+                     )) of
+        {_RawRows, _Count, _HasMore} = R ->
+            {R, St}
+    catch
+        error:{erlfdb_error, Code} ->
+            io:format("FDB Error: ~p~n", [Code]),
+            NTx = erlfdb:create_transaction(Db),
+            iter_future_(St#iter_st{tx = NTx})
+    end.
+
+iter_fwd_rev_(forward) -> 0;
+iter_fwd_rev_(reverse) -> 1.
+
+iter_start_end_(0, TableId, Type, Start) ->
+    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), Start}),
+    %% io:format("Start: sext:prefix({~p, ~p, ~p}).~n", [TableId, ?DATA_PREFIX(Type), Start]),
+    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), ?DATA_END})),
+    %% io:format("End: erlfdb_key:strinc(sext:prefix({~p, ~p, ~p})).~n", [TableId, ?DATA_PREFIX(Type), ?DATA_END]),
+    {erlfdb_key:first_greater_than(SKey), EKey};
+iter_start_end_(1, TableId, Type, Start) ->
+    %%    StartKey = sext:prefix({TableId, DPfx, ?DATA_END}),
+    %%    EndKey   = erlfdb_key:strinc(sext:prefix({TableId, DPfx, Key})),
+    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), Start}),
+    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), Start})),
+    {SKey, erlfdb_key:first_greater_or_equal(EKey)}.
+
+iter_limit_(_Iteration, 0) ->
+    false;
+iter_limit_(Iteration, IterLimit) ->
+    Iteration + 1 > IterLimit.
+
+iter_sel_(0, _StartSel, EndSel, LastKey) ->
+    {erlfdb_key:first_greater_than(LastKey), EndSel};
+iter_sel_(1, StartSel, _EndSel, LastKey) ->
+    {StartSel, erlfdb_key:first_greater_or_equal(LastKey)}.
 
 walk_range(?IS_DB = Db, StartKey, EndKey, Fun, Acc, Options) ->
     erlfdb:transactional(Db, fun(Tx) ->
