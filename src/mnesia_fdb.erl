@@ -772,13 +772,14 @@ do_select(Db, TableId, Tab, Type, MS, Limit) ->
     do_select(Db, TableId, Tab, Type, MS, false, Limit).
 
 do_select(Db, TableId, Tab, Type, MS, AccKeys, Limit) when is_boolean(AccKeys) ->
-    Keypat = keypat(MS, 2),
-    case Keypat of
+    case keypat(MS, 2) of
         <<>> ->
             %% Keys only
             SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
-            EKey = erlfdb_key:strinc(SKey),
-            keys_only(Db, TableId, SKey, EKey, []);
+%%            EKey = erlfdb_key:strinc(SKey),
+%%            keys_only(Db, TableId, SKey, EKey, []),
+            keys_only_iter(Db, TableId, Type, SKey);
+            %%keys_only_iter(mnesia_fdb_manager:st(Tab), ?FDB_WC);
         Keypat ->
             PackedKeypat = sext:prefix({TableId, ?DATA_PREFIX(Type), Keypat}),
             Sel = #sel{tab = Tab,
@@ -791,6 +792,44 @@ do_select(Db, TableId, Tab, Type, MS, AccKeys, Limit) when is_boolean(AccKeys) -
                        limit = Limit},
             do_select(Db, Sel, Type, AccKeys, [])
     end.
+
+keys_only_iter(St, StartKey) ->
+    keys_only_iter(St, StartKey, erlang:timestamp(), []).
+
+keys_only_iter(#st{db = Db, tab = Tab, table_id = TableId, type = Type} = St, Key, LastStatus0, Acc) ->
+    case mnesia_fdb:iter(Db, TableId, Type, Key, forward) of
+        '$end_of_table' ->
+            lists:reverse(Acc);
+        {K, '$end_of_table'} ->
+            Last = case (length(Acc) rem 10000) =:= 0 of
+                true ->
+            N = erlang:timestamp(),
+            io:format("reached: ~p at ~p took ~ps ~n", [K, length(Acc), timer:now_diff(N, LastStatus0)/100000]),
+            N;
+        false ->
+            LastStatus0
+            end,
+            keys_only_iter(St, K, Last, [K |Acc])
+    end.
+
+%%keys_only_iter(Db, TableId, Type, StartKey) ->
+%%    Iter = iter(Db, TableId, Type, StartKey, forward, 0),
+%%    keys_only_iter_(Iter, erlang:timestamp(), []).
+%%
+%%keys_only_iter_({K, ?IS_ITERATOR = Iter}, LastStatus0, Acc) ->
+%%    Last = case (length(Acc) rem 10000) =:= 0 of
+%%        true ->
+%%            N = erlang:timestamp(),
+%%            io:format("reached: ~p took ~ps ~n", [length(Acc), timer:now_diff(N, LastStatus0)/100000]),
+%%            N;
+%%        false ->
+%%            LastStatus0
+%%    end,
+%%    keys_only_iter_(iter_cont(Iter), Last, [K | Acc]);
+%%keys_only_iter_({K, '$end_of_table'}, _Last, Acc) ->
+%%    lists:reverse([K | Acc]);
+%%keys_only_iter_('$end_of_table', _Last, Acc) ->
+%%    lists:reverse(Acc).
 
 keys_only(Db, TableId, StartKey, EndKey, Acc) ->
     case keys_only_(Db, TableId, StartKey, EndKey, Acc) of
@@ -806,8 +845,7 @@ keys_only_(Db, TableId, StartKey, EndKey, Acc) ->
     Fun = fun({EncKey, _EncVal}, {LastKey, _InnerAcc} = Next) when EncKey =:= LastKey ->
                   Next;
              ({EncKey, _EncVal}, {_LastKey, InnerAcc}) ->
-                  Key = mnesia_fdb_lib:decode_key(EncKey, TableId),
-                  {EncKey, [Key | InnerAcc]}
+                  {EncKey, [mnesia_fdb_lib:decode_key(EncKey, TableId) | InnerAcc]}
           end,
     erlfdb:fold_range(Db, StartKey, EndKey, Fun, {StartKey, Acc}, [{limit, 500}]).
 
@@ -1101,6 +1139,7 @@ iter(?IS_DB = Db, TableId, Type, StartKey, Direction) ->
 
 iter(?IS_DB = Db, TableId, Type, StartKey, Direction, IterLimit) ->
     Tx = erlfdb:create_transaction(Db),
+    erlfdb_nif:transaction_set_option(Tx, disallow_writes, 1),
     Reverse = iter_fwd_rev_(Direction),
     {SKey, EKey} = iter_start_end_(Reverse, TableId, Type, StartKey),
     St = #iter_st{
@@ -1116,12 +1155,12 @@ iter(?IS_DB = Db, TableId, Type, StartKey, Direction, IterLimit) ->
             target_bytes = 0,
             streaming_mode = iterator,
             iteration = 1,
-            snapshot = false,
+            snapshot = true,
             reverse = Reverse
            },
     iter_int_({cont, St}).
 
-iter_int_({cont, #iter_st{start_sel = StartSel, end_sel = EndSel,
+iter_int_({cont, #iter_st{tx = Tx, start_sel = StartSel, end_sel = EndSel,
                           reverse = Reverse, table_id = TableId,
                           iter_limit = IterLimit, iteration = Iteration} = St0}) ->
     {{RawRows, Count, HasMore}, St} = iter_future_(St0),
@@ -1132,10 +1171,12 @@ iter_int_({cont, #iter_st{start_sel = StartSel, end_sel = EndSel,
             LastKey = element(1, hd(RawRows)),
             {NStartSel, NEndSel} = iter_sel_(Reverse, StartSel, EndSel, LastKey),
             DecodedKey = mnesia_fdb_lib:decode_key(LastKey, TableId),
+            %% io:format("Count: ~p ~p ~p~n", [Count, DecodedKey, HasMore]),
             HitLimit = iter_limit_(Iteration, IterLimit),
             Done = RawRows =:= [] orelse HitLimit =:= true orelse (HitLimit =:= false andalso not HasMore),
             case Done of
                 true ->
+                    catch erlfdb:commit(Tx),
                     {DecodedKey, '$end_of_table'};
                 false ->
                     NSt = St#iter_st{
@@ -1159,7 +1200,7 @@ iter_future_(#iter_st{db = Db, tx = Tx, start_sel = StartKey,
                       EndKey,
                       Limit,
                       TargetBytes,
-                      StreamingMode,
+                      small,
                       Iteration,
                       Snapshot,
                       Reverse
@@ -1168,9 +1209,13 @@ iter_future_(#iter_st{db = Db, tx = Tx, start_sel = StartKey,
             {R, St}
     catch
         error:{erlfdb_error, Code} ->
-            io:format("FDB Error: ~p~n", [Code]),
+            io:format("FDB error: ~p~n", [Code]),
+            ok = erlfdb:wait(erlfdb:on_error(Tx, Code)),
+            catch erlfdb:commit(Tx),
             NTx = erlfdb:create_transaction(Db),
+            erlfdb_nif:transaction_set_option(NTx, disallow_writes, 1),
             iter_future_(St#iter_st{tx = NTx})
+            %%iter_future_(St#iter_st{tx = Tx})
     end.
 
 iter_fwd_rev_(forward) -> 0;
