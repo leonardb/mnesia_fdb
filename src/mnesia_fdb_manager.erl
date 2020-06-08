@@ -151,11 +151,12 @@ load_fdb_nif_(#conn{tls_key_path = KeyPath, tls_cert_path = CertPath, tls_ca_pat
     end.
 
 st(Tab) ->
+    ?dbg("Getting state for ~p", [Tab]),
     case ets:lookup(?MODULE, Tab) of
         [#st{} = St] ->
             St;
         _ ->
-            error(badarg)
+            badarg
     end.
 
 db_conn_() ->

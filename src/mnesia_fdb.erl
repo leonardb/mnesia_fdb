@@ -109,7 +109,7 @@
 -export([ix_prefixes/3]).
 
 %% exported for manual testing
--export([iter/5, iter/6, iter_cont/1]).
+-export([iter_/10, iter_/11, iter_cont/1, select_return_keysonly_/1]).
 
 %% ----------------------------------------------------------------------------
 %% DEFINES
@@ -458,18 +458,6 @@ delete(Alias, Tab, Key) ->
     #st{} = St = mnesia_fdb_manager:st(Tab),
     do_delete(Key, St).
 
-first(Alias, Tab) ->
-    ?dbg("~p : first(~p, ~p)", [self(), Alias, Tab]),
-    #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab),
-    StartKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
-    EndKey = erlfdb_key:strinc(StartKey),
-    case erlfdb:get_range(Db, StartKey, EndKey, [{limit,1}]) of
-        [] ->
-            '$end_of_table';
-        [{EncKey, _}] ->
-            mnesia_fdb_lib:decode_key(EncKey, TableId)
-    end.
-
 %% Not relevant for an ordered_set
 fixtable(_Alias, _Tab, _Bool) ->
     ?dbg("~p : fixtable(~p, ~p, ~p)", [self(),_Alias, _Tab, _Bool]),
@@ -484,17 +472,6 @@ insert(_Alias, Tab, Obj) ->
     Key = element(Pos, Obj),
     Val = setelement(Pos, Obj, []),
     do_insert(Key, Val, St).
-
-last(Alias, Tab) ->
-    ?dbg("~p : last(~p, ~p)", [self(), Alias, Tab]),
-    #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab),
-    Key = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
-    case mnesia_fdb:iter(Db, TableId, Type, Key, reverse) of
-        '$end_of_table' ->
-            '$end_of_table';
-        {K, '$end_of_table'} ->
-            K
-    end.
 
 %% Since the key is replaced with [] in the record, we have to put it back
 %% into the found record.
@@ -565,24 +542,70 @@ match_delete(_Alias, Tab, Pat) when is_tuple(Pat) ->
     end,
     ok.
 
+first(Alias, Tab) ->
+    ?dbg("~p : first(~p, ~p)", [self(), Alias, Tab]),
+    #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab),
+    StartKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
+    EndKey = erlfdb_key:strinc(StartKey),
+    case erlfdb:get_range(Db, StartKey, EndKey, [{limit,1}]) of
+        [] ->
+            '$end_of_table';
+        [{EncKey, _}] ->
+            mnesia_fdb_lib:decode_key(EncKey, TableId)
+    end.
+
 next(Alias, Tab, Key) ->
     ?dbg("~p : next(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
     #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab),
-    case mnesia_fdb:iter(Db, TableId, Type, Key, forward) of
-        '$end_of_table' ->
+    SKey = sext:encode({TableId, ?DATA_PREFIX(Type), Key}),
+    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC})),
+    case erlfdb:get_range(Db, SKey, EKey, [{limit, 2}]) of
+        [] ->
             '$end_of_table';
-        {K, '$end_of_table'} ->
-            K
+        [{K,_}] ->
+            case mnesia_fdb_lib:decode_key(K, TableId) of
+                Key ->
+                    '$end_of_table';
+                OutKey ->
+                    OutKey
+            end;
+        [{K0,_}, {K1, _}] ->
+            Key0 = mnesia_fdb_lib:decode_key(K0, TableId),
+            Key1 = mnesia_fdb_lib:decode_key(K1, TableId),
+            hd(lists:delete(Key, [Key0, Key1]))
     end.
 
 prev(Alias, Tab, Key) ->
     ?dbg("~p : prev(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
     #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab),
-    case mnesia_fdb:iter(Db, TableId, Type, Key, reverse) of
-        '$end_of_table' ->
+    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
+    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), Key})),
+    case erlfdb:get_range(Db, SKey, EKey, [{reverse, true}, {limit, 2}]) of
+        [] ->
             '$end_of_table';
-        {K, '$end_of_table'} ->
-            K
+        [{K,_}] ->
+            case mnesia_fdb_lib:decode_key(K, TableId) of
+                Key ->
+                    '$end_of_table';
+                OutKey ->
+                    OutKey
+            end;
+        [{K0,_}, {K1, _}] ->
+            Key0 = mnesia_fdb_lib:decode_key(K0, TableId),
+            Key1 = mnesia_fdb_lib:decode_key(K1, TableId),
+            hd(lists:delete(Key, [Key0, Key1]))
+    end.
+
+last(Alias, Tab) ->
+    ?dbg("~p : last(~p, ~p)", [self(), Alias, Tab]),
+    #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab),
+    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
+    EKey = erlfdb_key:strinc(SKey),
+    case erlfdb:get_range(Db, SKey, EKey, [{reverse, true}, {limit, 1}]) of
+        [] ->
+            '$end_of_table';
+        [{K, _}] ->
+            mnesia_fdb_lib:decode_key(K, TableId)
     end.
 
 repair_continuation(Cont, _Ms) ->
@@ -590,7 +613,7 @@ repair_continuation(Cont, _Ms) ->
     Cont.
 
 select(Cont) ->
-    ?dbg("~p : select(~p)", [self(), Cont]),
+    ?dbg("~p : select(~p) mnesia_activity: ~p", [self(), Cont, get(mnesia_activity_state)]),
     %% Handle {ModOrAlias, Cont} wrappers for backwards compatibility with
     %% older versions of mnesia_ext (before OTP 20).
     case Cont of
@@ -601,17 +624,17 @@ select(Cont) ->
     end.
 
 select(Alias, Tab, Ms) ->
-    ?dbg("select( ~p, ~p, ~p)~n", [Alias, Tab, Ms]),
-    case select(Alias, Tab, Ms, infinity) of
+    ?dbg("select( ~p, ~p, ~p) mnesia_activity: ~p~n", [Alias, Tab, Ms, get(mnesia_activity_state)]),
+    case select(Alias, Tab, Ms, 0) of
         {Res, '$end_of_table'} ->
             Res;
         '$end_of_table' ->
             '$end_of_table'
     end.
 
-select(Alias, Tab, Ms, Limit) when Limit =:= infinity orelse is_integer(Limit) ->
-    ?dbg("~p : select(~p, ~p, ~p, ~p)", [self(),Alias, Tab, Ms, Limit]),
+select(Alias, Tab, Ms, Limit) when is_integer(Limit) ->
     #st{db = Db, table_id = TableId, tab = Tab, type = Type} = mnesia_fdb_manager:st(Tab),
+    ?dbg("~p : select(~p, ~p, ~p, ~p) mnesia_activity: ~p", [self(),Alias, Tab, Ms, Limit, get(mnesia_activity_state)]),
     do_select(Db, TableId, Tab, Type, Ms, Limit).
 
 slot(_A, _B, _C) ->
@@ -772,138 +795,87 @@ do_select(Db, TableId, Tab, Type, MS, Limit) ->
     do_select(Db, TableId, Tab, Type, MS, false, Limit).
 
 do_select(Db, TableId, Tab, Type, MS, AccKeys, Limit) when is_boolean(AccKeys) ->
-    case keypat(MS, 2) of
-        <<>> ->
-            %% Keys only
-            SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
-%%            EKey = erlfdb_key:strinc(SKey),
-%%            keys_only(Db, TableId, SKey, EKey, []),
-            keys_only_iter(Db, TableId, Type, SKey);
-            %%keys_only_iter(mnesia_fdb_manager:st(Tab), ?FDB_WC);
-        Keypat ->
-            PackedKeypat = sext:prefix({TableId, ?DATA_PREFIX(Type), Keypat}),
-            Sel = #sel{tab = Tab,
-                       table_id = TableId,
-                       db = Db,
-                       keypat = PackedKeypat,
-                       ms = MS,
-                       compiled_ms = ets:match_spec_compile(MS),
-                       key_only = needs_key_only(MS),
-                       limit = Limit},
-            do_select(Db, Sel, Type, AccKeys, [])
+    Keypat0 = keypat(MS, 2),
+    %%KeysOnly = needs_key_only(MS),
+    {ReturnKeysOnly, NeedKeysOnly} = select_return_keysonly_(MS),
+    InTransaction = is_in_transaction(),
+    case {ReturnKeysOnly, NeedKeysOnly} of
+        {true, true} ->
+            ?dbg("Keys only query", []),
+            CompiledMs = undefined,
+            DataFun = undefined,
+            InAcc = [],
+            Iter = iter_(Db, TableId, Tab, Type, ?FDB_WC, ReturnKeysOnly, NeedKeysOnly, CompiledMs, DataFun, InAcc, Limit),
+            %% io:format("Keys only: ~p~n", [needs_key_only(MS)]),
+            do_iter(InTransaction, Iter, Limit, []);
+        _ ->
+            ?dbg("Need Keys for query", []),
+            Keypat = case Keypat0 of
+                         <<>> -> ?FDB_WC;
+                         Keypat0 -> Keypat0
+                     end,
+            CompiledMs = ets:match_spec_compile(MS),
+            DataFun = undefined,
+            InAcc = [],
+            Iter = iter_(Db, TableId, Tab, Type, Keypat, ReturnKeysOnly, NeedKeysOnly, CompiledMs, DataFun, InAcc, Limit),
+            do_iter(InTransaction, Iter, Limit, [])
     end.
 
-keys_only_iter(St, StartKey) ->
-    keys_only_iter(St, StartKey, erlang:timestamp(), []).
-
-keys_only_iter(#st{db = Db, tab = Tab, table_id = TableId, type = Type} = St, Key, LastStatus0, Acc) ->
-    case mnesia_fdb:iter(Db, TableId, Type, Key, forward) of
+do_iter(_InTransaction, '$end_of_table', Limit, Acc) when Limit =:= 0 ->
+    {Acc, '$end_of_table'};
+do_iter(_InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit =:= 0 ->
+    {lists:append(Acc, Data), '$end_of_table'};
+do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit =:= 0 andalso is_function(Iter) ->
+    NAcc = lists:append(Acc, Data),
+    case Iter() of
         '$end_of_table' ->
-            lists:reverse(Acc);
-        {K, '$end_of_table'} ->
-            Last = case (length(Acc) rem 10000) =:= 0 of
-                true ->
-            N = erlang:timestamp(),
-            io:format("reached: ~p at ~p took ~ps ~n", [K, length(Acc), timer:now_diff(N, LastStatus0)/100000]),
-            N;
+            NAcc;
+        {_, '$end_of_table'} = NIter ->
+            do_iter(_InTransaction, NIter, Limit, NAcc);
+        {_, ?IS_ITERATOR} = NIter ->
+            do_iter(_InTransaction, NIter, Limit, NAcc)
+    end;
+do_iter(InTransaction, '$end_of_table', Limit, Acc) when Limit > 0 ->
+    case InTransaction of
+        true ->
+            {Acc, '$end_of_table'};
         false ->
-            LastStatus0
-            end,
-            keys_only_iter(St, K, Last, [K |Acc])
+            Acc
+    end;
+do_iter(InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit > 0 ->
+    case InTransaction of
+        true ->
+            {lists:append(Acc, Data), '$end_of_table'};
+        false ->
+            lists:append(Acc, Data)
+    end;
+do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit > 0 andalso is_function(Iter) ->
+    NAcc = lists:append(Acc, Data),
+    {NAcc, Iter}.
+
+is_in_transaction() ->
+    case get(mnesia_activity_state) of
+        {mnesia,MTid,_} when element(1, MTid) =:= tid ->
+            true;
+        _ ->
+            false
     end.
 
-%%keys_only_iter(Db, TableId, Type, StartKey) ->
-%%    Iter = iter(Db, TableId, Type, StartKey, forward, 0),
-%%    keys_only_iter_(Iter, erlang:timestamp(), []).
-%%
-%%keys_only_iter_({K, ?IS_ITERATOR = Iter}, LastStatus0, Acc) ->
-%%    Last = case (length(Acc) rem 10000) =:= 0 of
-%%        true ->
-%%            N = erlang:timestamp(),
-%%            io:format("reached: ~p took ~ps ~n", [length(Acc), timer:now_diff(N, LastStatus0)/100000]),
-%%            N;
-%%        false ->
-%%            LastStatus0
-%%    end,
-%%    keys_only_iter_(iter_cont(Iter), Last, [K | Acc]);
-%%keys_only_iter_({K, '$end_of_table'}, _Last, Acc) ->
-%%    lists:reverse([K | Acc]);
-%%keys_only_iter_('$end_of_table', _Last, Acc) ->
-%%    lists:reverse(Acc).
-
-keys_only(Db, TableId, StartKey, EndKey, Acc) ->
-    case keys_only_(Db, TableId, StartKey, EndKey, Acc) of
-        {error, _} = E ->
-            mnesia:abort(E);
-        {StartKey, NAcc} ->
-            {lists:reverse(NAcc), '$end_of_table'};
-        {NStartKey, NAcc} ->
-            keys_only(Db, TableId, NStartKey, EndKey, NAcc)
-    end.
-
-keys_only_(Db, TableId, StartKey, EndKey, Acc) ->
-    Fun = fun({EncKey, _EncVal}, {LastKey, _InnerAcc} = Next) when EncKey =:= LastKey ->
-                  Next;
-             ({EncKey, _EncVal}, {_LastKey, InnerAcc}) ->
-                  {EncKey, [mnesia_fdb_lib:decode_key(EncKey, TableId) | InnerAcc]}
-          end,
-    erlfdb:fold_range(Db, StartKey, EndKey, Fun, {StartKey, Acc}, [{limit, 500}]).
-
-do_select(Db, #sel{keypat = FirstKey,
-                   lastval = LastVal,
-                   table_id = TableId,
-                   tab = Tab,
-                   compiled_ms = MS,
-                   limit = Limit} = Sel,
-          Type, AccKeys, Acc) ->
-    case do_select_(Db, TableId, Type, Tab, FirstKey, LastVal, AccKeys, Limit, MS, Acc) of
-        {error, _} = E ->
-            mnesia:abort(E);
-        {FirstKey, _, NAcc} ->
-            {lists:reverse(NAcc), '$end_of_table'};
-        {NFirstKey, NLastVal, NAcc} ->
-            do_select(Db, Sel#sel{keypat = NFirstKey, lastval = NLastVal}, Type, AccKeys, NAcc)
-    end.
-
-do_select_(Db, TableId, Type, Tab, StartKey, LastVal, AccKeys, Limit, MS, Acc) ->
-    Fun = fun({EncKey, _EncVal}, {LastKey, _LastEncVal, _InnerAcc} = Next)
-                when Type =/= bag andalso EncKey =:= LastKey ->
-                  Next;
-             ({EncKey, EncVal}, {LastKey, LastEncVal, _InnerAcc} = Next)
-                when Type =:= bag andalso EncKey =:= LastKey andalso EncVal =:= LastEncVal ->
-                  Next;
-             ({EncKey, EncVal}, {_LastKey, _LastEncVal, InnerAcc}) ->
-                  Key = mnesia_fdb_lib:decode_key(EncKey, TableId),
-                  Val = decode_val(Db, EncVal),
-                  Rec = setelement(keypos(Tab), Val, Key),
-                  case ets:match_spec_run([Rec], MS) of
-                      [] ->
-                          {EncKey, EncVal, InnerAcc};
-                      [Match] when AccKeys =:= true ->
-                          {EncKey, EncVal, [{Key, Match} | InnerAcc]};
-                      [Match] when AccKeys =:= false ->
-                          {EncKey, EncVal, [Match | InnerAcc]}
-                  end
-          end,
-    EndKey = erlfdb_key:strinc(StartKey),
-    LimitArgs = case Limit of
-                    infinity -> [{limit, 10}];
-                    Limit -> [{limit, Limit}]
-                end,
-    erlfdb:fold_range(Db, StartKey, EndKey, Fun, {StartKey, LastVal, Acc}, LimitArgs).
-
-needs_key_only([{HP,_,Body}]) ->
+select_return_keysonly_([{HP,Guards,Body}]) ->
     BodyVars = lists:flatmap(fun extract_vars/1, Body),
     %% Note that we express the conditions for "needs more than key" and negate.
-    not(wild_in_body(BodyVars) orelse
-        case bound_in_headpat(HP) of
-            {all,V} -> lists:member(V, BodyVars);
-            none    -> false;
-            Vars    -> any_in_body(lists:keydelete(2,1,Vars), BodyVars)
-        end);
-needs_key_only(_) ->
-    %% don't know
-    false.
+    WildInBody = wild_in_body(BodyVars),
+    BoundInHeadPatt = bound_in_headpat(HP),
+    %%io:format("BodyVars: ~p~n", [BodyVars]),
+    %%io:format("WildInBody: ~p~n", [WildInBody]),
+    %%io:format("BoundInHeadPatt: ~p~n", [BoundInHeadPatt]),
+    {2, [IdBind]} = hd(BoundInHeadPatt),
+    ReturnKeysOnly = not WildInBody andalso (IdBind =/= ['_'] andalso BodyVars =:= [IdBind]),
+    NeedKeysOnly = ReturnKeysOnly andalso Guards =:= [],
+    %%io:format("ReturnKeysOnly: ~p NeedKeysOnly: ~p~n", [ReturnKeysOnly, NeedKeysOnly]),
+    {ReturnKeysOnly, NeedKeysOnly};
+select_return_keysonly_(_) ->
+    {false, false}.
 
 extract_vars([H|T]) ->
     extract_vars(H) ++ extract_vars(T);
@@ -1132,110 +1104,186 @@ iter_cont(?IS_ITERATOR = Iterator) ->
 iter_cont(_) ->
     '$end_of_table'.
 
--spec iter(Db :: ?IS_DB, TableId :: binary(), Type :: atom(), StartKey :: any(), Direction :: forward | reverse) ->
-                  '$end_of_table' | ?IS_ITERATOR.
-iter(?IS_DB = Db, TableId, Type, StartKey, Direction) ->
-    iter(?IS_DB = Db, TableId, Type, StartKey, Direction, 1).
+-spec iter_(Db :: ?IS_DB, TableId :: binary(), Tab :: atom(), Type :: atom(), StartKey :: any(), ReturnKeysOnly :: boolean(), NeedKeysOnly :: boolean(), Ms :: ets:comp_match_spec(), DataFun :: undefined | function(), InAcc :: list()) ->
+                   {list(), '$end_of_table'} | {list(), ?IS_ITERATOR}.
+iter_(?IS_DB = Db, TableId, Tab, Type, StartKey, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, InAcc) ->
+    iter_(?IS_DB = Db, TableId, Tab, Type, StartKey, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, InAcc, 0).
 
-iter(?IS_DB = Db, TableId, Type, StartKey, Direction, IterLimit) ->
-    Tx = erlfdb:create_transaction(Db),
-    erlfdb_nif:transaction_set_option(Tx, disallow_writes, 1),
-    Reverse = iter_fwd_rev_(Direction),
-    {SKey, EKey} = iter_start_end_(Reverse, TableId, Type, StartKey),
-    St = #iter_st{
-            db = Db,
-            tx = Tx,
-            table_id = TableId,
-            type = Type,
-            iter_limit = IterLimit,
-            start_key = SKey,
-            start_sel = erlfdb_key:to_selector(SKey),
-            end_sel = erlfdb_key:to_selector(EKey),
-            limit = 0,
-            target_bytes = 0,
-            streaming_mode = iterator,
-            iteration = 1,
-            snapshot = true,
-            reverse = Reverse
-           },
+-spec iter_(Db :: ?IS_DB, TableId :: binary(), Tab :: atom(), Type :: atom(), StartKey :: any(), ReturnKeysOnly :: boolean(), NeedKeysOnly :: boolean(), Ms :: ets:comp_match_spec(), DataFun :: undefined | function(), InAcc :: list(), DataLimit :: pos_integer()) ->
+                   {list(), '$end_of_table'} | {list(), ?IS_ITERATOR}.
+iter_(?IS_DB = Db, TableId, Tab, Type, StartKey, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, InAcc, DataLimit) ->
+    Reverse = 0, %% we're not iterating in reverse
+    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), StartKey}),
+    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_END})),
+    St0 = #iter_st{
+             db = Db,
+             table_id = TableId,
+             tab = Tab,
+             type = Type,
+             data_limit = DataLimit,
+             data_acc = InAcc,
+             data_fun = DataFun,
+             return_keys_only = ReturnKeysOnly,
+             need_keys_only = NeedKeysOnly,
+             compiled_ms = Ms,
+             start_key = SKey,
+             start_sel = erlfdb_key:to_selector(erlfdb_key:first_greater_than(SKey)),
+             end_sel = erlfdb_key:to_selector(EKey),
+             limit = 100, %% we use a fix limit of 100 for the number of KVs to pull
+             target_bytes = 0,
+             streaming_mode = iterator,
+             iteration = 1,
+             snapshot = true,
+             reverse = Reverse
+            },
+    St = iter_transaction_(St0),
     iter_int_({cont, St}).
 
-iter_int_({cont, #iter_st{tx = Tx, start_sel = StartSel, end_sel = EndSel,
-                          reverse = Reverse, table_id = TableId,
-                          iter_limit = IterLimit, iteration = Iteration} = St0}) ->
-    {{RawRows, Count, HasMore}, St} = iter_future_(St0),
+iter_int_({cont, #iter_st{tx = Tx,
+                          table_id = TableId, tab = Tab,
+                          return_keys_only = ReturnKeysOnly, need_keys_only = NeedKeysOnly,
+                          compiled_ms = Ms,
+                          data_limit = DataLimit, %% Max rec in accum per continuation
+                          data_count = DataCount, %% count in continuation accumulator
+                          data_acc = DataAcc, %% accum for continuation
+                          data_fun = DataFun, %% Fun applied to selected data when not key-only
+                          iteration = Iteration} = St0}) ->
+    {{RawRows, Count, HasMore0}, St} = iter_future_(St0),
     case Count of
         0 ->
-            '$end_of_table';
+            {DataAcc, '$end_of_table'};
         _ ->
-            LastKey = element(1, hd(RawRows)),
-            {NStartSel, NEndSel} = iter_sel_(Reverse, StartSel, EndSel, LastKey),
-            DecodedKey = mnesia_fdb_lib:decode_key(LastKey, TableId),
-            %% io:format("Count: ~p ~p ~p~n", [Count, DecodedKey, HasMore]),
-            HitLimit = iter_limit_(Iteration, IterLimit),
-            Done = RawRows =:= [] orelse HitLimit =:= true orelse (HitLimit =:= false andalso not HasMore),
+            {Rows, HasMore, LastKey} = rows_more_last_(DataLimit, DataCount, RawRows,
+                                                       Count, HasMore0),
+            %% io:format("Rows: ~p~n", [Rows]),
+            %% io:format("DataAcc: ~p~n", [DataAcc]),
+            {NewDataAcc, AddCount} = iter_append_(Rows, Tx, TableId,
+                                                  Tab, ReturnKeysOnly, NeedKeysOnly, Ms,
+                                                  DataFun, 0, DataAcc),
+            %% io:format("NewDataAcc: ~p~n", [NewDataAcc]),
+            ?dbg("Count: ~p ~p ~p~n", [Count, HasMore, sext:decode(LastKey)]),
+            NewDataCount = DataCount + AddCount,
+            HitLimit = hit_data_limit_(NewDataCount, DataLimit),
+            Done = RawRows =:= []
+                orelse HitLimit =:= true
+                orelse (HitLimit =:= false andalso HasMore =:= false),
             case Done of
-                true ->
-                    catch erlfdb:commit(Tx),
-                    {DecodedKey, '$end_of_table'};
+                true when HasMore =:= false ->
+                    %% no more rows
+                    iter_commit_(Tx),
+                    {lists:reverse(NewDataAcc), '$end_of_table'};
+                true when HasMore =:= true ->
+                    %% there are more rows, return accumulated data and a continuation fun
+                    NSt0 = St#iter_st{
+                             start_sel = erlfdb_key:first_greater_than(LastKey),
+                             iteration = Iteration + 1,
+                             data_count = 0,
+                             data_acc = []
+                            },
+                    NSt = iter_transaction_(NSt0),
+                    {lists:reverse(NewDataAcc), fun() -> iter_cont({cont, NSt}) end};
                 false ->
-                    NSt = St#iter_st{
-                            start_key = DecodedKey,
-                            start_sel = NStartSel,
-                            end_sel = NEndSel,
-                            iteration = Iteration + 1
-                           },
-                    {DecodedKey, {cont, NSt}}
+                    %% there are more rows, but we need to continue accumulating
+                    %% This loops internally, so no fun, just the continuation
+                    NSt0 = St#iter_st{
+                             start_sel = erlfdb_key:first_greater_than(LastKey),
+                             iteration = Iteration + 1,
+                             data_count = NewDataCount,
+                             data_acc = NewDataAcc
+                            },
+                    NSt = iter_transaction_(NSt0),
+                    iter_int_({cont, NSt})
             end
     end.
 
-iter_future_(#iter_st{db = Db, tx = Tx, start_sel = StartKey,
+iter_append_([], _Tx, _TableId, _Tab, _ReturnKeysOnly,  _NeedKeysOnly, _Ms, _DataFun, AddCount, Acc) ->
+    {Acc, AddCount};
+iter_append_([{K, _V} | Rest], Tx, TableId, Tab, true = ReturnKeysOnly, true = NeedKeysOnly, Ms, DataFun, AddCount, Acc) ->
+    %% DataFun is not applied for key-only operations
+    Key = mnesia_fdb_lib:decode_key(K, TableId),
+    iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, AddCount + 1, [Key | Acc]);
+iter_append_([{K, V} | Rest], Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount, Acc) ->
+    Key = mnesia_fdb_lib:decode_key(K, TableId),
+    Value = decode_val(Tx, V),
+    Rec = setelement(keypos(Tab), Value, Key),
+    %% io:format("Not keys only: ~p ~p~n", [Rec, Ms]),
+    case Ms =/= undefined andalso ets:match_spec_run([Rec], Ms) of
+        false  when is_function(DataFun, 2) ->
+            %% Record matched specification, is a fold operation, apply the supplied DataFun
+            NAcc = DataFun(Rec, Acc),
+            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, NAcc);
+        false ->
+            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, [iter_val_(ReturnKeysOnly, Key, Rec) | Acc]);
+        [] ->
+            %% Record did not match specification
+            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount, Acc);
+        [_Match] when DataFun =:= undefined ->
+            %% Record matched specification, but not a fold operation
+            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, [iter_val_(ReturnKeysOnly, Key, Rec) | Acc]);
+        [_Match] when is_function(DataFun, 2) ->
+            %% Record matched specification, is a fold operation, apply the supplied DataFun
+            NAcc = DataFun(Rec, Acc),
+            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, NAcc)
+    end.
+
+iter_val_(true, Key, _Rec) ->
+    Key;
+iter_val_(false, _Key, Rec) ->
+    Rec.
+
+
+iter_future_(#iter_st{tx = Tx, start_sel = StartKey,
                       end_sel = EndKey, limit = Limit,
                       target_bytes = TargetBytes, streaming_mode = StreamingMode,
                       iteration = Iteration, snapshot = Snapshot,
-                      reverse = Reverse} = St) ->
+                      reverse = Reverse} = St0) ->
     try erlfdb:wait(erlfdb_nif:transaction_get_range(
                       Tx,
                       StartKey,
                       EndKey,
                       Limit,
                       TargetBytes,
-                      small,
+                      StreamingMode,
                       Iteration,
                       Snapshot,
                       Reverse
                      )) of
         {_RawRows, _Count, _HasMore} = R ->
-            {R, St}
+            {R, St0}
     catch
         error:{erlfdb_error, Code} ->
             io:format("FDB error: ~p~n", [Code]),
             ok = erlfdb:wait(erlfdb:on_error(Tx, Code)),
-            catch erlfdb:commit(Tx),
-            NTx = erlfdb:create_transaction(Db),
-            erlfdb_nif:transaction_set_option(NTx, disallow_writes, 1),
-            iter_future_(St#iter_st{tx = NTx})
-            %%iter_future_(St#iter_st{tx = Tx})
+            St = iter_transaction_(St0),
+            iter_future_(St)
     end.
 
-iter_fwd_rev_(forward) -> 0;
-iter_fwd_rev_(reverse) -> 1.
+iter_transaction_(#iter_st{db = Db, tx = Tx} = St) ->
+    iter_commit_(Tx),
+    NTx = erlfdb:create_transaction(Db),
+    erlfdb_nif:transaction_set_option(NTx, disallow_writes, 1),
+    St#iter_st{tx = NTx}.
 
-iter_start_end_(0, TableId, Type, Start) ->
-    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), Start}),
-    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_END})),
-    {erlfdb_key:first_greater_than(SKey), EKey};
-iter_start_end_(1, TableId, Type, Start) ->
-    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
-    EKey = sext:prefix({TableId, ?DATA_PREFIX(Type), Start}),
-    {SKey, erlfdb_key:first_greater_or_equal(EKey)}.
+iter_commit_(undefined) ->
+    ok;
+iter_commit_(?IS_TX = Tx) ->
+    catch erlfdb:wait(erlfdb:commit(Tx)),
+    ok.
 
-iter_limit_(_Iteration, 0) ->
+hit_data_limit_(_DataCount, 0) ->
     false;
-iter_limit_(Iteration, IterLimit) ->
-    Iteration + 1 > IterLimit.
+hit_data_limit_(DataCount, IterLimit) ->
+    DataCount + 1 > IterLimit.
 
-iter_sel_(0, _StartSel, EndSel, LastKey) ->
-    {erlfdb_key:first_greater_than(LastKey), EndSel};
-iter_sel_(1, StartSel, _EndSel, LastKey) ->
-    {StartSel, erlfdb_key:first_greater_or_equal(LastKey)}.
+rows_more_last_(0, _DataCount, RawRows, _Count, HasMore0) ->
+    LastKey0 = element(1, lists:last(RawRows)),
+    {RawRows, HasMore0, LastKey0};
+rows_more_last_(DataLimit, DataCount, RawRows, Count, HasMore0)
+  when (DataLimit - DataCount) > Count ->
+    LastKey0 = element(1, lists:last(RawRows)),
+    {RawRows, HasMore0, LastKey0};
+rows_more_last_(DataLimit, DataCount, RawRows, _Count, HasMore0) ->
+    Rows0 = lists:sublist(RawRows, DataLimit - DataCount),
+    NHasMore = HasMore0 orelse length(RawRows) > (DataLimit - DataCount),
+    LastKey0 = element(1, lists:last(Rows0)),
+    {Rows0, NHasMore, LastKey0}.
