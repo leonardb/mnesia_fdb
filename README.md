@@ -2,12 +2,18 @@
 
 A FoundationDB backend for Mnesia.
 
-Status: very 'alpha' **warning. It may eat your data**
-
-This permits Erlang/OTP applications to use FoundationDB as a backend for
+Permits Erlang/OTP applications to use FoundationDB as a backend for
 mnesia tables. It is based on Aeternity's `mnesia_rocksdb` which was based on Klarna's `mnesia_eleveldb`.
 
-Contributions *very* welcome
+Contributions and feedback are welcome.
+
+### TODO / Help Wanted
+- [ ] Secondary Indexes
+- [ ] Watch table definition keys for changes (eg, index added on a different node)
+- [ ] Investigate possibility of using the FDB directory layer rather than using packed prefixes
+- [ ] Performance improvements, especially in the iterator
+- [ ] Backup/restore
+
 
 ## FoundationDB
 
@@ -19,7 +25,7 @@ store and employs ACID transactions for all operations. It is especially well-su
 for read/write workloads but also has excellent performance for write-intensive 
 workloads.
 
-Since FoundationDB is ACID everything is transactional, and mnesia:dirty_ functions are
+Since FoundationDB is ACID, everything is transactional, and mnesia:dirty_ functions are
 still transactional
 
 ## Prerequisites
@@ -59,11 +65,11 @@ tables you want to be in FoundationDB.
 
 ## Special features
 
-FoundationDB tables is an ordered key/value store.
+FoundationDB is an ordered key/value store.
 
-To support the concept of tables an HCA is used to assign prefix values
-for tables as they are created. This prefix is then used for all keys
-within the table.
+To support the concept of tables in the mnesia backend an HCA is used 
+to assign prefix values for tables as they are created. This prefix 
+is then used for all keys within the table.
 
 Each record also uses a 'DataPrefix'
 - <<"d">> for set/ordered_set tables
@@ -71,11 +77,11 @@ Each record also uses a 'DataPrefix'
 - <<"p">> for 'parts' of values larger than 90Kb
 
 ### Key internals (set/ordered_set)
- - keys are encoded using `erlfdb_tuple_pack('{<<"d">>, sext:encode(Key)}, Prefix)`
+ - set/ordered_set keys are encoded using `sext:encode({TableId, <<"d">>, Key})`
  
 ### Key internals (bag)
   - bag tables use an HCA pre table for assigning suffixes to duplicate keys
-  - keys are encoded using `erlfdb_tuple_pack('{<<"b">>, sext:encode(Key), Incr}, Prefix)`
+  - keys are encoded using `sext:encode({TableId, <<"b">>, Key, BagHac})`
 
 ### Large values
  FoundationDb limits the size of values to 100Kb. `mnesia_fdb` splits larger values into 90Kb chunks.
@@ -90,7 +96,7 @@ rd(test, {id, value}).
 mnesia:create_table(foo, [{fdb_copies, [node()]},
                           {attributes, record_info(fields, test)},
                           {record_name,test},
-                          {type, set}]).
+                          {type, ordered_set}]).
 ```
 
 ## Handling of errors in write operations
@@ -102,14 +108,8 @@ since the operations are expected to simply work.
 
 ## Caveats
 
-Avoid placing `bag` tables in `mnesia_fdb`. Although they work, each write
-requires additional reads, causing substantial runtime overheads. There
-are better ways to represent and process bag data.
+While `bag` tables are supported there is substantial runtime overhead as they
+require additional reads. There may be better ways to represent and process bag data.
 
 The `mnesia:table_info(T, size)` call always returns zero for FoundationDB
 tables. FoundationDB itself does not track the number of elements in a table.
-
-## TODO and Ideas
-- [ ] Proper support for continuations (currently we process the entire match set)
-- [ ] Possibly use the FDB directory layer instead of relying on HCA prefixes?
-- [ ] Secondary index support
