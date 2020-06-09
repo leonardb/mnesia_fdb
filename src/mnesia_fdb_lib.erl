@@ -34,7 +34,7 @@ put(#st{db = ?IS_TX = Tx, table_id = TableId, hca_ref = HcaRef, type = Type}, KV
 put_(_Tx, _TableId, _HcaRef, []) ->
     ok;
 put_(Tx, TableId, HcaRef, [{K, V0} | Rest]) ->
-    EncKey = erlfdb_tuple:pack({<<"d">>, sext:encode(K)}, TableId),
+    EncKey = sext:encode({TableId, <<"d">>, K}),
     V = term_to_binary(V0),
     %% io:format("Put:~nTableId: ~p~nK: ~p~nEncK: ~p~n V0: ~p~nV: ~p~n",
     %%           [TableId, K, EncKey, V0, V]),
@@ -60,13 +60,13 @@ put_bag_(_Tx, _TableId, _HcaBag, _HcaRef, []) ->
     %% io:format("put_bag_ complete~n"),
     ok;
 put_bag_(Tx, TableId, HcaBag, HcaRef, [{K, V0} | Rest]) ->
-    StartKey = erlfdb_tuple:pack({<<"b">>, sext:encode(K)}, TableId),
-    %% io:format("put_bag_ start key: erlfdb_tuple:pack({<<\"b\">>, ~p}, ~p) -> ~p~n", [K, TableId, StartKey]),
+    StartKey = sext:encode({TableId, <<"b">>, K}),
+    %% io:format("put_bag_ start key: sext:encode({TableId, <<\"b\">>, ~p}) -> ~p~n", [TableId, K, StartKey]),
     V = term_to_binary(V0),
     case erlfdb:wait(erlfdb:get_range(Tx, StartKey, erlfdb_key:strinc(StartKey))) of
         [] ->
             %% io:format("not matches:~n", []),
-            EncKey = erlfdb_tuple:pack({<<"b">>, sext:encode(K), erlfdb_hca:allocate(HcaBag, Tx)}, TableId),
+            EncKey = sext:encode({TableId, <<"b">>, K, erlfdb_hca:allocate(HcaBag, Tx)}),
             case byte_size(V) > ?MAX_VALUE_SIZE of
                 true ->
                     %% io:format("We have a big bin: ~p ~p~n", [byte_size(V), ?MAX_VALUE_SIZE]),
@@ -84,7 +84,7 @@ put_bag_(Tx, TableId, HcaBag, HcaRef, [{K, V0} | Rest]) ->
 
 bag_maybe_replace_([], Tx, TableId, HcaBag, HcaRef, {K, V}) ->
     %% We did not have a matching value, so add
-    EncKey = erlfdb_tuple:pack({<<"b">>, sext:encode(K), erlfdb_hca:allocate(HcaBag, Tx)}, TableId),
+    EncKey = sext:encode({TableId, <<"b">>, K, erlfdb_hca:allocate(HcaBag, Tx)}),
     case byte_size(V) > ?MAX_VALUE_SIZE of
         true ->
             MfdbRefPrefix = save_parts(Tx, TableId, HcaRef, V),
@@ -116,7 +116,7 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, hca_bag = HcaBag, hca_ref = HcaRef
 put(#st{db = ?IS_TX = Tx, table_id = TableId, hca_bag = HcaBag, hca_ref = HcaRef, type = bag}, K, V) ->
     put_bag_(Tx, TableId, HcaBag, HcaRef, [{K, V}]);
 put(#st{db = ?IS_DB = Db, table_id = TableId, hca_ref = HcaRef}, K, V0) ->
-    EncKey = erlfdb_tuple:pack({<<"d">>, sext:encode(K)}, TableId),
+    EncKey = sext:encode({TableId, <<"d">>, K}),
     V = term_to_binary(V0),
     %% io:format("Put:~nTableId: ~p~nK: ~p~nEncK: ~p~n V0: ~p~nV: ~p~n",
     %%           [TableId, K, EncKey, V0, V]),
@@ -139,11 +139,11 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, hca_ref = HcaRef}, K, V0) ->
     end.
 
 delete(#st{db = DbOrTx, table_id = TableId, type = bag}, K) ->
-    StartKey = erlfdb_tuple:pack({<<"b">>, sext:encode(K)}, TableId),
+    StartKey = sext:encode({TableId, <<"b">>, K}),
     %% When db is a transaction we do _NOT_ commit, it's the caller's responsibility
     do_delete_bag(DbOrTx, StartKey);
 delete(#st{db = ?IS_DB = Db, table_id = TableId}, K) ->
-    EncKey = erlfdb_tuple:pack({<<"d">>, sext:encode(K)}, TableId),
+    EncKey = sext:encode({TableId, <<"d">>, K}),
     case erlfdb:get(Db, EncKey) of
         not_found ->
             ok;
@@ -156,7 +156,7 @@ delete(#st{db = ?IS_DB = Db, table_id = TableId}, K) ->
     ok = erlfdb:clear(Db, EncKey);
 delete(#st{db = ?IS_TX = Tx, table_id = TableId}, K) ->
     %% When db is a transaction we do _NOT_ commit, it's the caller's responsibility
-    EncKey = erlfdb_tuple:pack({<<"d">>, sext:encode(K)}, TableId),
+    EncKey = sext:encode({TableId, <<"d">>, K}),
     case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
         not_found ->
             ok;
@@ -235,26 +235,28 @@ bin_join(BinList) ->
     << <<B/bits>> || {_, <<B>>} <- lists:keysort(1, BinList) >>.
 
 decode_key(Bin, TableId) ->
-    case erlfdb_tuple:unpack(Bin, TableId) of
-        {<<"d">>, Enc} ->
-            sext:decode(Enc);
-        {<<"b">>, Enc, _Suffix} ->
-            sext:decode(Enc)
+    case sext:decode(Bin) of
+        {TableId, <<"d">>, Key} ->
+            Key;
+        {TableId, <<"b">>, Key, _Suffix} ->
+            Key;
+        BadVal ->
+            exit({TableId, BadVal})
     end.
 
 save_parts(?IS_TX = Tx, TableId, Hca, Bin) ->
     PartId = erlfdb_hca:allocate(Hca, Tx),
-    PartKey = erlfdb_tuple:pack({<<"p">>, PartId, <<"_">>}, TableId),
+    PartKey = sext:prefix({TableId, <<"p">>, PartId, <<"_">>, '_'}),
     ok = save_parts_(Tx, TableId, PartId, 0, Bin),
     PartKey.
 
 save_parts_(_Tx, _TableId, _PartId, _PartInc, <<>>) ->
     ok;
 save_parts_(Tx, TableId, PartId, PartInc, <<Part:?MAX_VALUE_SIZE/binary, Rest/binary>>) ->
-    Key = erlfdb_tuple:pack({<<"p">>, PartId, <<"_">>, PartInc}, TableId),
+    Key = sext:encode({TableId, <<"p">>, PartId, <<"_">>, PartInc}),
     ok = erlfdb:wait(erlfdb:set(Tx, Key, term_to_binary(PartInc, Part))),
     save_parts_(Tx, TableId, PartId, PartInc + 1, Rest);
 save_parts_(Tx, TableId, PartId, PartInc, Tail) ->
-    Key = erlfdb_tuple:pack({<<"p">>, PartId, <<"_">>, PartInc}, TableId),
+    Key = sext:encode({TableId, <<"p">>, PartId, <<"_">>, PartInc}),
     ok = erlfdb:wait(erlfdb:set(Tx, Key, term_to_binary(PartInc, Tail))),
     save_parts_(Tx, TableId, PartId, PartInc + 1, <<>>).
