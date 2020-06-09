@@ -872,7 +872,7 @@ select_return_keysonly_([{HP,Guards,Body}]) ->
     {2, [IdBind]} = hd(BoundInHeadPatt),
     ReturnKeysOnly = not WildInBody andalso (IdBind =/= ['_'] andalso BodyVars =:= [IdBind]),
     NeedKeysOnly = ReturnKeysOnly andalso Guards =:= [],
-    %%io:format("ReturnKeysOnly: ~p NeedKeysOnly: ~p~n", [ReturnKeysOnly, NeedKeysOnly]),
+    %% io:format("ReturnKeysOnly: ~p NeedKeysOnly: ~p~n", [ReturnKeysOnly, NeedKeysOnly]),
     {ReturnKeysOnly, NeedKeysOnly};
 select_return_keysonly_(_) ->
     {false, false}.
