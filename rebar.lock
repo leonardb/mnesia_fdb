@@ -1,5 +1,9 @@
 {"1.1.0",
-[{<<"sext">>,{pkg,<<"sext">>,<<"1.6.0">>},0}]}.
+[{<<"erlfdb">>,
+  {git,"https://github.com/leonardb/couchdb-erlfdb.git",
+       {ref,"6a84378bd8637b58150c95b1905fd7257618f8dd"}},
+  0},
+ {<<"sext">>,{pkg,<<"sext">>,<<"1.6.0">>},0}]}.
 [
 {pkg_hash,[
  {<<"sext">>, <<"E5466AC5A9622AB1A6BCA4311913515082BB0F6A6799C73400906C0CD141AD5D">>}]}
