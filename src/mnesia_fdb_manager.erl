@@ -23,11 +23,11 @@
 -behaviour(gen_server).
 
 -export([load_table/2,
-         store/2,
+         create/2,
          delete/1,
-         create/2]).
-
--export([st/1]).
+         load_if_exists/1,
+         st/1,
+         store/2]).
 
 -export([start_link/0,
          init/1,
@@ -42,50 +42,69 @@
 
 -include("mnesia_fdb.hrl").
 
--ifdef(DEBUG).
--define(dbg(Fmt, Args), io:fwrite(user,"~p:~p: "++(Fmt),[?MODULE,?LINE|Args])).
+-ifndef(MNESIA_FDB_NO_DBG).
+-define(dbg(Fmt, Args),
+        %% avoid evaluating Args if the message will be dropped anyway
+        case mnesia_monitor:get_env(debug) of
+            none -> ok;
+            verbose -> ok;
+            _ -> mnesia_lib:dbg_out("~p:~p: "++(Fmt)++"~n",[?MODULE,?LINE|Args])
+        end).
 -else.
 -define(dbg(Fmt, Args), ok).
 -endif.
 
+%%%% API for mnesia_fdb module %%%%%
+create(Tab0, Props) ->
+    Tab = tab_name_(Tab0),
+    ?dbg("CREATE TABLE ~p -> ~p~n", [Tab0, Tab]),
+    gen_server:call(?MODULE, {create, Tab, Props}).
+
+delete(Tab0) ->
+    Tab = tab_name_(Tab0),
+    ?dbg("DELETE TABLE ~p~n", [Tab]),
+    gen_server:call(?MODULE, {delete, Tab}).
+
 load_table(Tab0, _Default) ->
-    io:format("LOOKUP TABLE ~p~n", [Tab0]),
-    %% TODO: This needs to change when to support secondary indexes
-    Tab = case is_atom(Tab0) of
-              true -> Tab0;
-              false -> element(1, Tab0)
-          end,
+    Tab = tab_name_(Tab0),
+    ?dbg("LOOKUP TABLE ~p~n", [Tab0]),
     try ets:lookup(?MODULE, Tab) of
         [#st{tab = Tab} = Rec] ->
-            io:format("lookup_ ~p got from ETS~n", [Tab]),
             Rec;
         [] ->
             badarg
     catch error:badarg ->
-        io:format("lookup_ ~p badarg~n", [Tab]),
-        badarg
+            badarg
     end.
 
-store(Tab, MetaData) ->
-    io:format("STORE TABLE ~p ~p~n", [Tab, MetaData]),
+load_if_exists(Tab0) ->
+    Tab = tab_name_(Tab0),
+    try ets:lookup(?MODULE, Tab) of
+        [#st{tab = Tab}] ->
+            ok;
+        [] ->
+            gen_server:call(?MODULE, {load, Tab})
+    catch error:badarg ->
+            badarg
+    end.
+
+st(Tab0) ->
+    Tab = tab_name_(Tab0),
+    case ets:lookup(?MODULE, Tab) of
+        [#st{} = St] ->
+            ?dbg("Got state for ~p", [Tab]),
+            St;
+        _ ->
+            ?dbg("No state for ~p", [Tab]),
+            badarg
+    end.
+
+store(Tab0, MetaData) ->
+    Tab = tab_name_(Tab0),
+    ?dbg("STORE TABLE ~p ~p~n", [Tab, MetaData]),
     ets:insert(?MODULE, {Tab, MetaData}).
 
-delete(Tab0) ->
-    io:format("DELETE TABLE ~p~n", [Tab0]),
-    Tab = case is_atom(Tab0) of
-              true -> Tab0;
-              false -> element(1, Tab0)
-          end,
-    gen_server:call(?MODULE, {delete, Tab}).
-
-create(Tab0, Props) ->
-    io:format("CREATE TABLE ~p~n", [Tab0]),
-    Tab = case is_atom(Tab0) of
-              true -> Tab0;
-              false -> element(1, Tab0)
-          end,
-    gen_server:call(?MODULE, {create, Tab, Props}).
-
+%%%% Genserver
 start_link() ->
     case ets:info(?MODULE, name) of
         undefined ->
@@ -98,14 +117,19 @@ start_link() ->
 init(_) ->
     process_flag(trap_exit, true),
     ok = init_connection_(),
-    io:format("FDB Manager started with Pid: ~p~n", [self()]),
     {ok, []}.
 
 handle_call({delete, Tab}, _From, S) ->
     R = delete_(Tab),
+    ?dbg("fdb manager received delete. replying with ~p~n", [R]),
     {reply, R, S};
 handle_call({create, Tab, Props}, _From, S) ->
     R = create_(Tab, Props),
+    ?dbg("fdb manager received create. replying with ~p~n", [R]),
+    {reply, R, S};
+handle_call({load, Tab}, _From, S) ->
+    R = load_(Tab),
+    ?dbg("fdb manager received load. replying with ~p~n", [R]),
     {reply, R, S};
 handle_call(_, _, S) -> {reply, error, S}.
 handle_cast(_, S)    -> {noreply, S}.
@@ -148,15 +172,6 @@ load_fdb_nif_(#conn{tls_key_path = KeyPath, tls_cert_path = CertPath, tls_ca_pat
         error:{reload, _} ->
             io:format("NIF already loaded~n"),
             ok
-    end.
-
-st(Tab) ->
-    ?dbg("Getting state for ~p", [Tab]),
-    case ets:lookup(?MODULE, Tab) of
-        [#st{} = St] ->
-            St;
-        _ ->
-            badarg
     end.
 
 db_conn_() ->
@@ -215,22 +230,40 @@ mk_tab_(Db, TableId, Tab, TabBin, Props) ->
        hca_bag                 = HcaBag
       }.
 
+tab_name_({TabName, index, _}) ->
+    TabName;
+tab_name_({TabName, retainer, {Id, _Node}}) ->
+    list_to_atom(atom_to_list(TabName) ++ "_retainer_" ++ integer_to_list(Id));
+tab_name_(Tab) when is_atom(Tab) ->
+    Tab.
+
 create_(Tab, Props) ->
     TabBin = atom_to_binary(Tab, utf8),
     Db = db_conn_(),
     TabKey = <<"tbl_", TabBin/binary, "_settings">>,
-    Table = case erlfdb:get(Db, TabKey) of
-                not_found ->
-                    Hca = erlfdb_hca:create(<<"hca_table">>),
-                    TableId0 = erlfdb_hca:allocate(Hca, Db),
-                    Table0 = mk_tab_(Db, TableId0, Tab, TabBin, Props),
-                    ok = erlfdb:set(Db, TabKey, term_to_binary(Table0)),
-                    Table0;
-                Table0 ->
-                    #st{} = Table1 = binary_to_term(Table0),
-                    Table2 = Table1#st{db = Db},
-                    ok = erlfdb:set(Db, TabKey, term_to_binary(Table2)),
-                    Table2
-            end,
-    true = ets:insert(?MODULE, Table),
-    ok.
+    case load_(Tab) of
+        {error, not_found} ->
+            Hca = erlfdb_hca:create(<<"hca_table">>),
+            TableId0 = erlfdb_hca:allocate(Hca, Db),
+            Table0 = mk_tab_(Db, TableId0, Tab, TabBin, Props),
+            ok = erlfdb:set(Db, TabKey, term_to_binary(Table0)),
+            true = ets:insert(?MODULE, Table0),
+            ok;
+        ok ->
+            ok
+    end.
+
+load_(Tab) ->
+    TabBin = atom_to_binary(Tab, utf8),
+    Db = db_conn_(),
+    TabKey = <<"tbl_", TabBin/binary, "_settings">>,
+    case erlfdb:get(Db, TabKey) of
+        not_found ->
+            {error, not_found};
+        Table0 ->
+            #st{} = Table1 = binary_to_term(Table0),
+            Table2 = Table1#st{db = Db},
+            ok = erlfdb:set(Db, TabKey, term_to_binary(Table2)),
+            true = ets:insert(?MODULE, Table2),
+            ok
+    end.
