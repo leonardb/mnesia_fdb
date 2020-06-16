@@ -49,7 +49,8 @@
 
 -record(st,
         {
-         tab                   :: atom(),
+         tab                            :: binary(),
+         mtab                           :: any(), %% mnesia table spec
          type                   = set   :: set | ordered_set | bag,
          alias                          :: atom(),
          record_name                    :: atom(),
@@ -58,25 +59,28 @@
          on_write_error         = ?WRITE_ERR_DEFAULT :: on_write_error(),
          on_write_error_store   = ?WRITE_ERR_STORE_DEFAULT :: on_write_error_store(),
          db                             :: db(),
-         tab_bin                        :: binary(),
          table_id                       :: binary(),
          hca_bag,  %% opaque :: #erlfdb_hca{} record used for bag type table keys :: erlfdb_hca:create(<<"hca_", TableId/binary>>).
-         hca_ref   %% opaque :: #erlfdb_hca{} record used for mfdb_part() keys    :: erlfdb_hca:create(<<"parts_", TableId/binary>>).
+         hca_ref,   %% opaque :: #erlfdb_hca{} record used for mfdb_part() keys    :: erlfdb_hca:create(<<"parts_", TableId/binary>>).
+         info                   = []
         }).
+
+-record(info, {k, v}).
 
 -record(iter_st,
         {
          db :: db(),
          tx :: tx(),
          table_id :: binary(),
-         tab :: atom(),
+         tab :: binary(),
+         mtab :: any(), %% mnesia table id
          type :: atom(),
          data_count = 0 :: non_neg_integer(),
          data_limit = 0 :: non_neg_integer(),
          data_acc = [],
          data_fun :: undefined | function(),
-         return_keys_only = false :: boolean(),
-         need_keys_only = false :: boolean(),
+         acc_keys = false :: boolean(),
+         keys_only = false :: boolean(),
          compiled_ms,
          start_key :: any(),
          start_sel :: selector(),

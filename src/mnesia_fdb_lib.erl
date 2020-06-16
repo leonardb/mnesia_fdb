@@ -118,8 +118,8 @@ put(#st{db = ?IS_TX = Tx, table_id = TableId, hca_bag = HcaBag, hca_ref = HcaRef
 put(#st{db = ?IS_DB = Db, table_id = TableId, hca_ref = HcaRef}, K, V0) ->
     EncKey = sext:encode({TableId, <<"d">>, K}),
     V = term_to_binary(V0),
-    %% io:format("Put:~nTableId: ~p~nK: ~p~nEncK: ~p~n V0: ~p~nV: ~p~n",
-    %%           [TableId, K, EncKey, V0, V]),
+    io:format("Put:~nTableId: ~p~nK: ~p~nEncK: ~p~n V0: ~p~nV: ~p~n",
+              [TableId, K, EncKey, V0, V]),
     case byte_size(V) > ?MAX_VALUE_SIZE of
         true ->
             %% Ensure we remove any old parts
