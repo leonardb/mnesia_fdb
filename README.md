@@ -113,3 +113,75 @@ require additional reads. There may be better ways to represent and process bag 
 
 The `mnesia:table_info(T, size)` call always returns zero for FoundationDB
 tables. FoundationDB itself does not track the number of elements in a table.
+
+FoundationDB is limited with both key and value sizes. Keys < 10Kb and Values < 100Kb.
+In mnesia_fdb we have a hard limit of 9Kb for keys, and values are automatically split.
+
+Since secondary indexes in mnesia are stored as {{Value,Id}} keys, this makes
+supporting indexing of large values impossible.
+
+In order to support secondary indexes there is a hard limit on the sizes of values
+for indexed fields. This limit includes internal components.
+
+If a value for an indexed column exceeds the size limit an exception may occur or an informational error may be returned.
+
+Examples: 
+```erlang
+rd(test,{id,value,expires}).
+
+mnesia:create_table(test1, [{fdb_copies,[node()]},{type,ordered_set},{record_name, test},{attributes,record_info(fields,test)}]).
+
+mnesia:add_table_index(test1,#test.expires).
+
+Big = <<1:(1024*1024)>>.
+
+mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = 100}).
+ok
+
+W = fun(F) -> try F() of R -> io:format("Got result: ~p~n", [R]) catch E:M -> io:format("E: ~p~nM: ~p~n",[E,M]) end end.
+
+76> W(fun() -> mnesia:transaction(fun() -> mnesia:write(test1, #test{id = 6, value = Big, expires = Big}, write) end) end).
+Got result: {aborted,{value_too_large_for_field,expires}}
+ok
+77> W(fun() -> mnesia:activity(transaction, fun() -> mnesia:write(test1, #test{id = 6, value = Big, expires = Big}, write) end) end).
+E: exit
+M: {aborted,{value_too_large_for_field,expires}}
+ok
+78> W(fun() -> mnesia:activity(sync, fun() -> mnesia:write(test1, #test{id = 6, value = Big, expires = Big}, write) end) end).       
+Got result: {aborted,{bad_type,sync}}
+ok
+79> W(fun() -> mnesia:activity(async, fun() -> mnesia:write(test1, #test{id = 6, value = Big, expires = Big}, write) end) end).
+Got result: {aborted,{bad_type,async}}
+ok
+80> W(fun() -> mnesia:activity(dirty_sync, fun() -> mnesia:write(test1, #test{id = 6, value = Big, expires = Big}, write) end) end). 
+Got result: {aborted,{bad_type,dirty_sync}}
+ok
+81> W(fun() -> mnesia:activity(dirty_async, fun() -> mnesia:write(test1, #test{id = 6, value = Big, expires = Big}, write) end) end).
+Got result: {aborted,{bad_type,dirty_async}}
+ok
+82> W(fun() -> mnesia:transaction(fun() -> mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = Big}) end) end).           
+Got result: {aborted,{value_too_large_for_field,expires}}
+ok
+83> W(fun() -> mnesia:activity(transaction, fun() -> mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = Big}) end) end).
+E: exit
+M: {aborted,{value_too_large_for_field,expires}}
+ok
+84> W(fun() -> mnesia:activity(sync, fun() -> mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = Big}) end) end).       
+Got result: {aborted,{bad_type,sync}}
+ok
+85> W(fun() -> mnesia:activity(async, fun() -> mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = Big}) end) end).
+Got result: {aborted,{bad_type,async}}
+ok
+86> W(fun() -> mnesia:activity(dirty_sync, fun() -> mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = Big}) end) end). 
+Got result: {aborted,{bad_type,dirty_sync}}
+ok
+87> W(fun() -> mnesia:activity(dirty_async, fun() -> mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = Big}) end) end).
+Got result: {aborted,{bad_type,dirty_async}}
+ok
+88> W(fun() -> mnesia:dirty_write(test1, #test{id = 6, value = Big, expires = Big}) end).           
+E: error
+M: {badmatch,{error,{value_too_large_for_field,expires}}}
+ok
+
+
+```

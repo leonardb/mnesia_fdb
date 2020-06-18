@@ -44,23 +44,10 @@
 
 -include("mnesia_fdb.hrl").
 
--ifndef(MNESIA_FDB_NO_DBG).
--define(dbg(Fmt, Args),
-        %% avoid evaluating Args if the message will be dropped anyway
-        case mnesia_monitor:get_env(debug) of
-            none -> ok;
-            verbose -> ok;
-            _ -> mnesia_lib:dbg_out("~p:~p: "++(Fmt)++"~n",[?MODULE,?LINE|Args])
-        end).
--else.
--define(dbg(Fmt, Args), ok).
--endif.
-
 %%%% API for mnesia_fdb module %%%%%
-create(Tab0, Props) ->
-    Tab = tab_name_(Tab0),
-    ?dbg("CREATE TABLE ~p -> ~p~n", [Tab0, Tab]),
-    gen_server:call(?MODULE, {create, Tab, Tab0, Props}).
+create(Tab, Props) ->
+    ?dbg("CREATE TABLE ~p~n", [Tab]),
+    gen_server:call(?MODULE, {create, Tab, Props}).
 
 delete(Tab0) ->
     ?dbg("DELETE TABLE ~p~n", [Tab0]),
@@ -86,11 +73,20 @@ load_if_exists(Tab0) ->
             write_ets_infos_(Infos),
             ok;
         [] ->
-            gen_server:call(?MODULE, {load, Tab})
+            gen_server:call(?MODULE, {load, Tab0})
     catch error:badarg ->
             badarg
     end.
 
+st({Tab0, index, {Pos, _}}) ->
+    Tab = tab_name_(Tab0),
+    case ets:lookup(?MODULE, Tab) of
+        [#st{index = Indexes} = St] ->
+            #idx{table_id = ITabId, tab = ITab, mtab = IMtab} = element(Pos, Indexes),
+            St#st{table_id = ITabId, tab = ITab, mtab = IMtab};
+        _ ->
+            badarg
+    end;
 st(Tab0) ->
     Tab = tab_name_(Tab0),
     case ets:lookup(?MODULE, Tab) of
@@ -100,18 +96,25 @@ st(Tab0) ->
             badarg
     end.
 
-write_info({Tab0, index, {Idx, _}}, Key, Value) ->
-    Tab = tab_name_(Tab0),
-    case ets:lookup(?MODULE, Tab) of
-        [#st{info = Info0, db = Db} = St] ->
-            TabKey = <<"tbl_", Tab/binary, "_settings">>,
-            InfoKey = {Tab0, Idx, Key},
-            Info = kr_(InfoKey, 1, Info0, {InfoKey, Value}),
-            true = ets:insert(?MODULE, #info{k = InfoKey, v = Value}),
-            ok = erlfdb:set(Db, TabKey, term_to_binary(St#st{info = Info})),
-            ok;
+write_info({Parent, index, {Pos, _}}, index_consistent, Value) ->
+    ParentTab = tab_name_(Parent),
+    case ets:lookup(?MODULE, ParentTab) of
+        [#st{db = Db}] ->
+            PTabKey = <<"tbl_", ParentTab/binary, "_settings">>,
+            case erlfdb:get(Db, PTabKey) of
+                not_found ->
+                    ets:delete(?MODULE, ParentTab),
+                    badarg;
+                ParentBin ->
+                    #st{index = Indexes0} = ParentSt = binary_to_term(ParentBin),
+                    #idx{} = Idx = element(Pos, Indexes0),
+                    NIdx = Idx#idx{index_consistent = Value},
+                    NParentSt = ParentSt#st{index = setelement(Pos, Indexes0, NIdx)},
+                    true = ets:insert(?MODULE, NParentSt),
+                    ok = erlfdb:set(Db, PTabKey, term_to_binary(NParentSt))
+            end;
         _ ->
-            ?dbg("No state for ~p", [Tab]),
+            ?dbg("No state for ~p", [Parent]),
             badarg
     end;
 write_info(Tab0, Key, Value) when is_atom(Tab0) ->
@@ -129,10 +132,15 @@ write_info(Tab0, Key, Value) when is_atom(Tab0) ->
             badarg
     end.
 
-read_info({Tab0, index, {Idx, _}}, Key, Default) ->
-    case ets:lookup(?MODULE, {Tab0, Idx, Key}) of
-        [#info{v = Val}] ->
-            Val;
+read_info({Tab0, index, {Pos, _}}, index_consistent, Default) ->
+    case ets:lookup(?MODULE, tab_name_(Tab0)) of
+        [#st{index = Indexes}] ->
+            case element(Pos, Indexes) of
+                undefined ->
+                    Default;
+                #idx{index_consistent = Res} ->
+                    Res
+            end;
         [] ->
             Default
     end;
@@ -171,13 +179,17 @@ handle_call({delete, Tab0}, _From, S) ->
     R = delete_(Tab0),
     ?dbg("fdb manager received delete. replying with ~p~n", [R]),
     {reply, R, S};
-handle_call({create, Tab, MTab, Props}, _From, S) ->
-    R = create_(Tab, MTab, Props),
+handle_call({create, MTab, Props}, _From, S) ->
+    R = create_(MTab, Props),
     ?dbg("fdb manager received create. replying with ~p~n", [R]),
+    {reply, R, S};
+handle_call({load, {Tab, index, _}}, _From, S) ->
+    R = load_(Tab),
+    ?dbg("fdb manager received load. replying with ~p~n", [R]),
     {reply, R, S};
 handle_call({load, Tab}, _From, S) ->
     R = load_(Tab),
-    ?dbg("fdb manager received load. replying with ~p~n", [R]),
+    ?dbg("fdb manager received load for ~p. replying with ~p~n", [Tab, R]),
     {reply, R, S};
 handle_call(_, _, S) -> {reply, error, S}.
 handle_cast(_, S)    -> {noreply, S}.
@@ -232,49 +244,48 @@ db_conn_(#conn{cluster = Cluster} = Conn) ->
     {erlfdb_database, _} = Db = erlfdb:open(Cluster),
     Db.
 
+delete_({Parent0, index, {Pos, _}}) ->
+    ?dbg("Delete index at pos ~p on ~p~n", [Pos, Parent0]),
+    %% deleting an index
+    Parent = tab_name_(Parent0),
+    Db = db_conn_(),
+    ParentTabKey = <<"tbl_", Parent/binary, "_settings">>,
+    ParentBin = erlfdb:get(Db, ParentTabKey),
+    #st{index = Indexes0} = ParentSt = binary_to_term(ParentBin),
+    case element(Pos, Indexes0) of
+        undefined ->
+            ?dbg("Index at pos ~p on ~p is missing~n", [Pos, Parent0]),
+            ok;
+        #idx{table_id = IdxTabId} ->
+            %% delete all index values from DB
+            ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(IdxTabId, {?FDB_WC, ?FDB_WC})),
+            ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(IdxTabId, {?FDB_WC, ?FDB_WC, ?FDB_WC})),
+            NParentSt = ParentSt#st{index = setelement(Pos, Indexes0, undefined)},
+            ok = erlfdb:set(Db, ParentTabKey, term_to_binary(NParentSt)),
+            true = ets:insert(?MODULE, NParentSt),
+            ok
+    end;
 delete_(Tab0) ->
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
-    Tx = erlfdb:create_transaction(Db),
-    case erlfdb:wait(erlfdb:get(Tx, <<"tbl_", Tab/binary>>)) of
-        not_found ->
-            ok;
-        TableId ->
-            %% Remove all keys with matching table prefix
-            Prefixes = [{TableId},
-                        {TableId, ?FDB_WC},
-                        {TableId, ?FDB_WC, ?FDB_WC},
-                        {TableId, ?FDB_WC, ?FDB_WC, ?FDB_WC}],
-            [ok = erlfdb:wait(erlfdb:clear_range_startswith(Db, sext:prefix(Pfx))) || Pfx <- Prefixes]
-    end,
-    ok = erlfdb:wait(erlfdb:clear(Tx, <<"tbl_", Tab/binary>>)),
-    ok = erlfdb:wait(erlfdb:clear(Tx, <<"tbl_", Tab/binary, "_settings">>)),
-    ok = erlfdb:wait(erlfdb:commit(Tx)),
+    [#st{index = Indexes0, table_id = TableId}] = ets:lookup(?MODULE, Tab),
+    %% Remove indexes
+    [clear_index(Db, IdxTabId) || #idx{table_id = IdxTabId} <- tuple_to_list(Indexes0)],
+    ok = clear_table(Db, TableId),
+    ok = erlfdb:clear(Db, <<"tbl_", Tab/binary>>),
+    ok = erlfdb:clear(Db, <<"tbl_", Tab/binary, "_settings">>),
     ets:select_delete(?MODULE, [{#info{k = {Tab, '_'}, _ = '_'}, [], [true]}]),
+    ets:select_delete(?MODULE, [{#info{k = {Tab, '_', '_'}, _ = '_'}, [], [true]}]),
     ets:delete(?MODULE, Tab),
-    case Tab0 of
-        {Parent0, index, {Idx, _} = Idx0} ->
-            Parent = tab_name_(Parent0),
-            ?dbg("Removing index for ~p from ~p~n", [Tab0, Parent]),
-            case ets:lookup(?MODULE, Parent) of
-                [#st{tab = ParentTab, info = Info0, db = PDb, index = Indexes0} = PSt] ->
-                    ets:select_delete(?MODULE, [{#info{k = {Parent0, Idx, '_'}, _ = '_'}, [], [true]}]),
-                    Key = {Parent0, Idx, index_consistent},
-                    Info = lists:keydelete(Key, 1, Info0),
-                    Indexes = lists:delete(Idx0, Indexes0),
-                    NPSt = PSt#st{info = Info, index = Indexes},
-                    true = ets:insert(?MODULE, NPSt),
-                    TabKey = <<"tbl_", ParentTab/binary, "_settings">>,
-                    ok = erlfdb:set(PDb, TabKey, term_to_binary(NPSt)),
-                    ok;
-                _ ->
-                    ?dbg("No state for ~p", [Parent]),
-                    badarg
-            end;
-        _ ->
-            ok
-    end,
     ok.
+
+clear_index(Db, TableId) ->
+    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC})).
+
+clear_table(Db, TableId) ->
+    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {'_', '_', '_', '_'})),
+    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {'_', '_', '_'})),
+    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {'_', '_'})).
 
 mk_tab_(Db, TableId, Tab, MTab, Props) ->
     Type = proplists:get_value(type, Props, set),
@@ -288,53 +299,29 @@ mk_tab_(Db, TableId, Tab, MTab, Props) ->
                  bag -> erlfdb_hca:create(<<TableId/binary, "_hca_bag">>);
                  _ -> undefined
              end,
-    {Indexes, Infos} =
-        case MTab of
-            {Parent, index, {Idx, IType} = IdxFull} ->
-                ok = index_add_(Parent, IdxFull),
-                {[{Idx, IType}],
-                 [{{Parent, Idx, index_consistent}, true}]};
-            Parent ->
-                Indexes0 = proplists:get_value(index, Props, []),
-                {Indexes0,
-                 [{{Parent, Idx, index_consistent}, true} || {Idx, _} <- Indexes0]}
-        end,
-    #st{
-       tab                  = Tab,
-       mtab                 = MTab,
-       type                 = Type,
-       alias                = Alias,
-       record_name          = RecordName,
-       attributes           = Attributes,
-       index                = Indexes,
-       on_write_error       = OnWriteError,
-       on_write_error_store = OnWriteErrorStore,
-       db                   = Db,
-       table_id             = TableId,
-       hca_ref              = HcaRef,
-       hca_bag              = HcaBag,
-       info                 = Infos
-      }.
-
-index_add_(Tab0, {Idx, _} = IdxFull) ->
-    ?dbg("Add index ~p to ~p~n", [IdxFull, Tab0]),
-    Tab = tab_name_(Tab0),
-    case ets:lookup(?MODULE, Tab) of
-        [#st{db = Db, index = Indexes0, info = Info0} = St] ->
-            Key = {Tab0, Idx, index_consistent},
-            ?dbg("BEFORE INFOS/INDEXES ~p ~p nkey = ~p~n", [Info0, Indexes0, Key]),
-            Infos = kr_(Key, 1, Info0, {Key, true}),
-            Indexes = kr_(Idx, 1, Indexes0, IdxFull),
-            ?dbg("NEW INFOS/INDEXES ~p ~p~n", [Infos, Indexes]),
-            NSt = St#st{info = Infos, index = Indexes},
-            true = ets:insert(?MODULE, NSt),
-            TabKey = <<"tbl_", Tab/binary, "_settings">>,
-            ok = erlfdb:set(Db, TabKey, term_to_binary(NSt)),
-            write_ets_infos_(Infos),
-            ok;
-        _ ->
-            badarg
-    end.
+    IdxTuple = list_to_tuple(lists:duplicate(length(Attributes) + 1, undefined)),
+    Indexes = proplists:get_value(index, Props, []),
+    St = #st{
+            tab                  = Tab,
+            mtab                 = MTab,
+            type                 = Type,
+            alias                = Alias,
+            record_name          = RecordName,
+            attributes           = Attributes,
+            index                = IdxTuple,
+            on_write_error       = OnWriteError,
+            on_write_error_store = OnWriteErrorStore,
+            db                   = Db,
+            table_id             = TableId,
+            hca_ref              = HcaRef,
+            hca_bag              = HcaBag,
+            info                 = []
+           },
+    %% Now add the indexes to the state
+    lists:foldl(
+      fun(Idx, InSt) ->
+              create_index_({MTab, index, Idx}, Db, InSt)
+      end, St, Indexes).
 
 tab_name_({Tab, index, {{Pos},_}}) ->
     <<(atom_to_binary(Tab, utf8))/binary, "-=", (atom_to_binary(Pos, utf8))/binary, "=-_ix">>;
@@ -356,15 +343,31 @@ retainername_(Name) when is_list(Name) ->
 retainername_(Name) ->
     unicode:characters_to_binary(lists:flatten(io_lib:write(Name))).
 
-create_(Tab, MTab, Props) ->
+create_({Parent0, index, _} = MTab, _Props) ->
+    %% Create an index on the parent table
+    Db = db_conn_(),
+    ParentName = tab_name_(Parent0),
+    ParentTabKey = <<"tbl_", ParentName/binary, "_settings">>,
+    case erlfdb:get(Db, ParentTabKey) of
+        not_found ->
+            badarg;
+        ParentBin ->
+            Parent = binary_to_term(ParentBin),
+            NParent = create_index_(MTab, Db, Parent),
+            true = ets:insert(?MODULE, NParent),
+            ok = erlfdb:set(Db, ParentTabKey, term_to_binary(NParent))
+    end;
+create_(Tab0, Props) when is_atom(Tab0) ->
+    %% This is the actual table
+    Tab = tab_name_(Tab0),
     Db = db_conn_(),
     TabKey = <<"tbl_", Tab/binary, "_settings">>,
-    case load_(Tab) of
+    case load_(Tab0) of
         {error, not_found} ->
             Hca = erlfdb_hca:create(<<"hca_table">>),
             TableId0 = erlfdb_hca:allocate(Hca, Db),
-            ?dbg("MAKE TABLE ~p ~p~n", [Tab, MTab]),
-            #st{info = Infos} = Table0 = mk_tab_(Db, TableId0, Tab, MTab, Props),
+            ?dbg("MAKE TABLE ~p~n", [Tab]),
+            #st{info = Infos} = Table0 = mk_tab_(Db, TableId0, Tab, Tab0, Props),
             ok = erlfdb:set(Db, TabKey, term_to_binary(Table0)),
             true = ets:insert(?MODULE, Table0),
             write_ets_infos_(Infos),
@@ -373,7 +376,27 @@ create_(Tab, MTab, Props) ->
             ok
     end.
 
-load_(Tab) ->
+create_index_({_, index, {Pos, _}} = Tab, Db, #st{index = Indexes0} = Parent) ->
+    case element(Pos, Indexes0) of
+        #idx{} ->
+            %% Index already exists
+            Parent;
+        undefined ->
+            %% index does not yet exist, so create
+            Hca = erlfdb_hca:create(<<"hca_table">>),
+            IdxTableId = erlfdb_hca:allocate(Hca, Db),
+            IdxTabName = tab_name_(Tab),
+            Index = #idx{mtab = Tab,
+                         tab = IdxTabName,
+                         table_id = IdxTableId,
+                         pos = Pos,
+                         index_consistent = false},
+            Indexes = setelement(Pos, Indexes0, Index),
+            Parent#st{index = Indexes}
+    end.
+
+load_(Tab0) ->
+    Tab = tab_name_(Tab0),
     Db = db_conn_(),
     TabKey = <<"tbl_", Tab/binary, "_settings">>,
     case erlfdb:get(Db, TabKey) of
@@ -393,5 +416,5 @@ kr_(K,X,L,KV) ->
         false ->
             [KV | L];
         _ ->
-          lists:keyreplace(K,X,L,KV)
+            lists:keyreplace(K,X,L,KV)
     end.
