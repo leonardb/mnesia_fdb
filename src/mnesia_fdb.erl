@@ -463,6 +463,7 @@ lookup(Alias, Tab0, Key) ->
 
 lookup_bag(Db, TableId, Key, KeyPos) ->
     EncKey = mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX(bag), Key, ?FDB_WC}),
+    ?dbg("Bag prefix: ~p", [EncKey]),
     case erlfdb:get_range_startswith(Db, EncKey) of
         not_found ->
             [];
@@ -889,55 +890,11 @@ update_counter(Alias, Tab, Key, Incr) when is_integer(Incr) ->
 do_update_counter(_Key, _Incr, #st{type = bag}) ->
     mnesia:abort(badarg);
 do_update_counter(Key, Incr, #st{db = Db, table_id = TableId}) when is_integer(Incr) ->
-    %% Atomic counter increment
-    %% Mnesia counters are dirty only, and cannot go below zero
-    %%  dirty_update_counter({Tab, Key}, Incr) -> NewVal | exit({aborted, Reason})
-    %%    Calls mnesia:dirty_update_counter(Tab, Key, Incr).
-    %%
-    %%  dirty_update_counter(Tab, Key, Incr) -> NewVal | exit({aborted, Reason})
-    %%    Mnesia has no special counter records. However, records of
-    %%    the form {Tab, Key, Integer} can be used as (possibly disc-resident)
-    %%    counters when Tab is a set. This function updates a counter with a positive
-    %%    or negative number. However, counters can never become less than zero.
-    %%    There are two significant differences between this function and the action
-    %%    of first reading the record, performing the arithmetics, and then writing the record:
-    %%
-    %%    It is much more efficient. mnesia:dirty_update_counter/3 is performed as an
-    %%    atomic operation although it is not protected by a transaction.
-    %%    If two processes perform mnesia:dirty_update_counter/3 simultaneously, both
-    %%    updates take effect without the risk of losing one of the updates. The new
-    %%    value NewVal of the counter is returned.
-    %%
-    %%    If Key do not exists, a new record is created with value Incr if it is larger
-    %%    than 0, otherwise it is set to 0.
-    %%
-    %% This implementation tries to follow the same pattern.
-    %% Increment the counter and then read the new value
-    %%  - if the new value is < 0 (not allowed), abort
-    %%  - if the new value is > 0, return the new value
-    %% The exception:
-    %%   if the counter does not exist and is created with a Incr < 0
-    %%    we abort instead of creating a counter with value of '0'
     EncKey = mfdb_lib:encode_key(TableId, {<<"c">>, Key}),
     Tx = erlfdb:create_transaction(Db),
-    ok = erlfdb:wait(erlfdb:add(Tx, EncKey, Incr)),
-    case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
-        not_found ->
-            ok = erlfdb:wait(erlfdb:reset(Tx)),
-            %% Really should never hit this case
-            mnesia:abort(missing_counter);
-        <<NewVal:64/unsigned-little-integer>> when NewVal < 0 ->
-            %% Value for mnesia counter cannot be < 0
-            ok = erlfdb:wait(erlfdb:reset(Tx)),
-            mnesia:abort(counter_less_than_zero);
-        <<NewVal:64/unsigned-little-integer>> ->
-            ok = erlfdb:wait(erlfdb:commit(Tx)),
-            %% Counter incremented, return new value
-            %% This could very well not be what was expected
-            %% since the counter may have been incremented
-            %% by other transactions
-            NewVal
-    end.
+    {ok, NewVal} = mfdb_lib:update_counter(Tx, EncKey, Incr),
+    erlfdb:wait(erlfdb:commit(Tx)),
+    NewVal.
 
 %% PRIVATE
 
@@ -1094,14 +1051,18 @@ outer_match_fun_(OTableId, OMTab, OType, OCompiledKeyMs, AccKeys) ->
                 bag ->
                     Start = mfdb_lib:encode_prefix(OTableId, {?DATA_PREFIX(OType), Id, ?FDB_WC}),
                     End = erlfdb_key:strinc(mfdb_lib:encode_prefix(OTableId, {?DATA_PREFIX(OType), Id, ?FDB_WC})),
+                    ?dbg("bag outer match fun: id: ~p start: ~p end: ~p", [Id, Start, End]),
                     case erlfdb:wait(erlfdb:get_range(Tx, Start, End)) of
                         [] ->
+                            ?dbg("bag outer match fun: no results", []),
                             Acc0;
                         Possibles0 ->
+                            ?dbg("bag outer match fun possibles: ~p", [Possibles0]),
                             lists:foldl(
                               fun({_, V}, PossAcc) ->
                                       Value = mfdb_lib:decode_val(Tx, OTableId, V),
                                       Rec = setelement(keypos(OMTab), Value, Id),
+                                      ?dbg("bag outer match fun rec: ~p", [Rec]),
                                       case OCompiledKeyMs =/= undefined andalso
                                           ets:match_spec_run([Rec], OCompiledKeyMs) of
                                           [] ->
@@ -1123,6 +1084,7 @@ outer_match_fun_(OTableId, OMTab, OType, OCompiledKeyMs, AccKeys) ->
                               end, Acc0, Possibles0)
                     end;
                 _ ->
+                    ?dbg("NOT BAG outer match fun", []),
                     K = mfdb_lib:encode_key(OTableId, {?DATA_PREFIX(OType), Id}),
                     case erlfdb:wait(erlfdb:get(Tx, K)) of
                         not_found ->
@@ -1155,26 +1117,33 @@ outer_match_fun_(OTableId, OMTab, OType, OCompiledKeyMs, AccKeys) ->
     end.
 
 index_match_fun_(bag, ICompiledKeyMs, OuterMatchFun) ->
-    fun(Tx, {{V, {Id, _}}}, IAcc) ->
-        R = {{V, Id}},
-        case ICompiledKeyMs =/= undefined andalso
-            ets:match_spec_run([R], ICompiledKeyMs) of
-            [] ->
-                ?dbg("index_match_fun_ ~p not matched", [R]),
-                %% Did not match
-                IAcc;
-            [{{V, Id}}] ->
-                ?dbg("index_match_fun_ ~p matched", [R]),
-                %% Matched
-                OuterMatchFun(Tx, Id, IAcc);
+    fun(Tx, {{V, Id}} = R, IAcc) ->
+        ?dbg("keyfind ~p ~p", [Id, IAcc]),
+        case lists:keyfind(Id, 2, IAcc) =:= false of
+            true ->
+                case ICompiledKeyMs =/= undefined andalso
+                     ets:match_spec_run([R], ICompiledKeyMs) of
+                    [] ->
+                        ?dbg("index_match_fun_ ~p not matched", [R]),
+                        %% Did not match
+                        IAcc;
+                    [{{V, Id}}] ->
+                        ?dbg("index_match_fun_ ~p matched", [R]),
+                        %% Matched
+                        OuterMatchFun(Tx, Id, IAcc);
+                    false ->
+                        ?dbg("index_match_fun_ ~p no match spec", [R]),
+                        %% No match specification
+                        OuterMatchFun(Tx, Id, IAcc)
+                end;
             false ->
-                ?dbg("index_match_fun_ ~p no match spec", [R]),
-                %% No match specification
-                OuterMatchFun(Tx, Id, IAcc)
+                %% Id already processed
+                IAcc
         end
     end;
 index_match_fun_(_Type, ICompiledKeyMs, OuterMatchFun) ->
     fun(Tx, {{_, Id}} = R, IAcc) ->
+            ?dbg("not bag index match : ~p", [R]),
             case ICompiledKeyMs =/= undefined andalso
                 ets:match_spec_run([R], ICompiledKeyMs) of
                 [] ->
@@ -1410,6 +1379,28 @@ index_pfx(bag = Type, 'end', ?FDB_END, true) ->
     Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, ?FDB_END, ?FDB_WC},
     ?dbg("Bag prefix: ~p", [Pfx]),
     Pfx;
+index_pfx(bag = Type, start, Val, true) when is_atom(Val) ->
+    case atom_to_binary(Val, utf8) of
+        <<"$", _/binary>> ->
+            Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, ?FDB_WC, ?FDB_WC},
+            ?dbg("Bag prefix: ~p", [Pfx]),
+            Pfx;
+        _ ->
+            Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, Val, ?FDB_WC},
+            ?dbg("Bag prefix: ~p", [Pfx]),
+            Pfx
+    end;
+index_pfx(bag = Type, 'end', Val, true) when is_atom(Val) ->
+    case atom_to_binary(Val, utf8) of
+        <<"$", _/binary>> ->
+            Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, ?FDB_END, ?FDB_END},
+            ?dbg("Bag prefix: ~p", [Pfx]),
+            Pfx;
+        _ ->
+            Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, Val, ?FDB_END},
+            ?dbg("Bag prefix: ~p", [Pfx]),
+            Pfx
+    end;
 index_pfx(bag = Type, start, Val, true) ->
     Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, Val, ?FDB_WC},
     ?dbg("Bag prefix: ~p", [Pfx]),
@@ -1418,8 +1409,14 @@ index_pfx(bag = Type, 'end', Val, true) ->
     Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, Val, ?FDB_END},
     ?dbg("Bag prefix: ~p", [Pfx]),
     Pfx;
-index_pfx(Type, _, V, true) ->
-    {<<(?DATA_PREFIX(Type))/binary, "i">>, V}.
+index_pfx(Type, start, V, true) ->
+    Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, {V, ?FDB_WC}},
+    ?dbg("~p prefix: ~p", [Type, Pfx]),
+    Pfx;
+index_pfx(Type, 'end', V, true) ->
+    Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, {V, ?FDB_END}},
+    ?dbg("~p prefix: ~p", [Type, Pfx]),
+    Pfx.
 
 
 %% ----------------------------------------------------------------------------
@@ -1631,14 +1628,20 @@ iter_int_({cont, #iter_st{tx = Tx,
 iter_append_([], _Tx, _TableId, _MTab, _AccKeys, _KeysOnly, _Ms, _DataFun, AddCount, Acc) ->
     {Acc, AddCount};
 iter_append_([{K, V} | Rest], Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount, Acc) ->
+    IsIndexTbl = not is_atom(MTab),
     case mfdb_lib:decode_key(TableId, K) of
-        {idx, Idx} when is_function(DataFun, 3) ->
+        {idx, {{IK, IV}} = Idx} when IsIndexTbl andalso is_function(DataFun, 3) ->
             %% Record matched specification, is a fold operation, apply the supplied DataFun
-            NAcc = DataFun(Tx, Idx, Acc),
-            ?dbg("match with Fun: ~p => ~p~n~p~n", [Idx, NAcc =/= Acc, NAcc]),
-            iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc);
-        {idx, Idx} ->
-            case Ms =/= undefined andalso ets:match_spec_run([Idx], Ms) of
+            case not lists:member({IK,IV}, Acc) of
+                true ->
+                    NAcc = DataFun(Tx, Idx, Acc),
+                    ?dbg("match with Fun: ~p => ~p~n~p~n", [Idx, NAcc =/= Acc, NAcc]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc);
+                false ->
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, Acc)
+            end;
+        {idx, {{IK, IV}} = Idx} when IsIndexTbl ->
+            case not lists:member({IK,IV}, Acc) andalso Ms =/= undefined andalso ets:match_spec_run([Idx], Ms) of
                 false ->
                     ?dbg("No MS Acc: ~p ~p", [Idx, Acc]),
                     iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, Acc);
@@ -1647,10 +1650,10 @@ iter_append_([{K, V} | Rest], Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun,
                     iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, Acc);
                 [Match] ->
                     NAcc = [Match | Acc],
-                    ?dbg("Index Acc: ~p", [NAcc]),
+                    ?dbg("Index ~p Acc: ~p", [Idx, NAcc]),
                     iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc)
             end;
-        Key ->
+        Key when not IsIndexTbl ->
             ?dbg("decoded_key: ~p", [Key]),
             Value = mfdb_lib:decode_val(Tx, TableId, V),
             Rec = setelement(keypos(MTab), Value, Key),

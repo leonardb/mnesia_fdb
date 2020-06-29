@@ -269,9 +269,9 @@ delete_table_({Parent0, index, {Pos, _}}) ->
 delete_table_(Tab0) ->
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
-    [#st{index = Indexes0, table_id = TableId}] = ets:lookup(?MODULE, Tab),
+    [#st{index = Indexes0, table_id = TableId, type = Type}] = ets:lookup(?MODULE, Tab),
     %% Remove indexes
-    [clear_index(Db, IdxTabId) || #idx{table_id = IdxTabId} <- tuple_to_list(Indexes0)],
+    [clear_index(Db, Type, IdxTabId) || #idx{table_id = IdxTabId} <- tuple_to_list(Indexes0)],
     ok = clear_table(Db, TableId),
     ok = erlfdb:clear(Db, <<"tbl_", Tab/binary>>),
     ok = erlfdb:clear(Db, <<"tbl_", Tab/binary, "_settings">>),
@@ -280,7 +280,18 @@ delete_table_(Tab0) ->
     ets:delete(?MODULE, Tab),
     ok.
 
-clear_index(Db, TableId) ->
+clear_index(Db, bag, TableId) ->
+    IdxDataStart = mfdb_lib:encode_key(TableId, {<<"bi">>, ?FDB_WC, ?FDB_WC}),
+    IdxDataEnd = mfdb_lib:encode_key(TableId, {<<"bi">>, ?FDB_END, ?FDB_END}),
+    ok = erlfdb:clear_range(Db, IdxDataStart, IdxDataEnd),
+    IdxStart = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_WC}),
+    IdxEnd = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_END}),
+    ok = erlfdb:clear_range(Db, IdxStart, IdxEnd),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC}));
+clear_index(Db, _Type, TableId) ->
+    IdxDataStart = mfdb_lib:encode_key(TableId, {<<"di">>, ?FDB_WC}),
+    IdxDataEnd = mfdb_lib:encode_key(TableId, {<<"di">>, ?FDB_END}),
+    ok = erlfdb:clear_range(Db, IdxDataStart, IdxDataEnd),
     IdxStart = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_WC}),
     IdxEnd = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_END}),
     ok = erlfdb:clear_range(Db, IdxStart, IdxEnd),
