@@ -18,13 +18,13 @@
 %% Support of FoundationDB:
 %%  Copyright 2020 Leonard Boyce <leonard.boyce@lucidlayer.com>
 
--module(mnesia_fdb_manager).
+-module(mfdb_manager).
 
 -behaviour(gen_server).
 
 -export([load_table/2,
-         create/2,
-         delete/1,
+         create_table/2,
+         delete_table/1,
          load_if_exists/1,
          st/1]).
 
@@ -42,16 +42,16 @@
 %% private
 -export([db_conn_/0]).
 
--include("mnesia_fdb.hrl").
+-include("mfdb.hrl").
 
 %%%% API for mnesia_fdb module %%%%%
-create(Tab, Props) ->
+create_table(Tab, Props) ->
     ?dbg("CREATE TABLE ~p~n", [Tab]),
-    gen_server:call(?MODULE, {create, Tab, Props}).
+    gen_server:call(?MODULE, {create_table, Tab, Props}).
 
-delete(Tab0) ->
+delete_table(Tab0) ->
     ?dbg("DELETE TABLE ~p~n", [Tab0]),
-    gen_server:call(?MODULE, {delete, Tab0}).
+    gen_server:call(?MODULE, {delete_table, Tab0}).
 
 load_table(Tab0, _Default) ->
     Tab = tab_name_(Tab0),
@@ -73,7 +73,7 @@ load_if_exists(Tab0) ->
             write_ets_infos_(Infos),
             ok;
         [] ->
-            gen_server:call(?MODULE, {load, Tab0})
+            gen_server:call(?MODULE, {load_table, Tab0})
     catch error:badarg ->
             badarg
     end.
@@ -175,20 +175,20 @@ init(_) ->
     ok = init_connection_(),
     {ok, []}.
 
-handle_call({delete, Tab0}, _From, S) ->
-    R = delete_(Tab0),
+handle_call({delete_table, Tab0}, _From, S) ->
+    R = delete_table_(Tab0),
     ?dbg("fdb manager received delete. replying with ~p~n", [R]),
     {reply, R, S};
-handle_call({create, MTab, Props}, _From, S) ->
-    R = create_(MTab, Props),
+handle_call({create_table, MTab, Props}, _From, S) ->
+    R = create_table_(MTab, Props),
     ?dbg("fdb manager received create. replying with ~p~n", [R]),
     {reply, R, S};
-handle_call({load, {Tab, index, _}}, _From, S) ->
-    R = load_(Tab),
+handle_call({load_table, {Tab, index, _}}, _From, S) ->
+    R = load_table_(Tab),
     ?dbg("fdb manager received load. replying with ~p~n", [R]),
     {reply, R, S};
-handle_call({load, Tab}, _From, S) ->
-    R = load_(Tab),
+handle_call({load_table, Tab}, _From, S) ->
+    R = load_table_(Tab),
     ?dbg("fdb manager received load for ~p. replying with ~p~n", [Tab, R]),
     {reply, R, S};
 handle_call(_, _, S) -> {reply, error, S}.
@@ -244,7 +244,7 @@ db_conn_(#conn{cluster = Cluster} = Conn) ->
     {erlfdb_database, _} = Db = erlfdb:open(Cluster),
     Db.
 
-delete_({Parent0, index, {Pos, _}}) ->
+delete_table_({Parent0, index, {Pos, _}}) ->
     ?dbg("Delete index at pos ~p on ~p~n", [Pos, Parent0]),
     %% deleting an index
     Parent = tab_name_(Parent0),
@@ -258,14 +258,15 @@ delete_({Parent0, index, {Pos, _}}) ->
             ok;
         #idx{table_id = IdxTabId} ->
             %% delete all index values from DB
-            ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(IdxTabId, {?FDB_WC, ?FDB_WC})),
-            ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(IdxTabId, {?FDB_WC, ?FDB_WC, ?FDB_WC})),
+            ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(IdxTabId, {?FDB_WC})),
+            ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(IdxTabId, {?FDB_WC, ?FDB_WC})),
+            ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(IdxTabId, {?FDB_WC, ?FDB_WC, ?FDB_WC})),
             NParentSt = ParentSt#st{index = setelement(Pos, Indexes0, undefined)},
             ok = erlfdb:set(Db, ParentTabKey, term_to_binary(NParentSt)),
             true = ets:insert(?MODULE, NParentSt),
             ok
     end;
-delete_(Tab0) ->
+delete_table_(Tab0) ->
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
     [#st{index = Indexes0, table_id = TableId}] = ets:lookup(?MODULE, Tab),
@@ -280,12 +281,18 @@ delete_(Tab0) ->
     ok.
 
 clear_index(Db, TableId) ->
-    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC})).
+    IdxStart = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_WC}),
+    IdxEnd = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_END}),
+    ok = erlfdb:clear_range(Db, IdxStart, IdxEnd),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC})).
 
 clear_table(Db, TableId) ->
-    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {'_', '_', '_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {'_', '_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mnesia_fdb_lib:encode_prefix(TableId, {'_', '_'})).
+    ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"c">>})),
+    ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"s">>})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_', '_', '_'})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_', '_'})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_'})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_'})).
 
 mk_tab_(Db, TableId, Tab, MTab, Props) ->
     Type = proplists:get_value(type, Props, set),
@@ -343,7 +350,7 @@ retainername_(Name) when is_list(Name) ->
 retainername_(Name) ->
     unicode:characters_to_binary(lists:flatten(io_lib:write(Name))).
 
-create_({Parent0, index, _} = MTab, _Props) ->
+create_table_({Parent0, index, _} = MTab, _Props) ->
     %% Create an index on the parent table
     Db = db_conn_(),
     ParentName = tab_name_(Parent0),
@@ -357,12 +364,12 @@ create_({Parent0, index, _} = MTab, _Props) ->
             true = ets:insert(?MODULE, NParent),
             ok = erlfdb:set(Db, ParentTabKey, term_to_binary(NParent))
     end;
-create_(Tab0, Props) when is_atom(Tab0) ->
+create_table_(Tab0, Props) when is_atom(Tab0) ->
     %% This is the actual table
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
     TabKey = <<"tbl_", Tab/binary, "_settings">>,
-    case load_(Tab0) of
+    case load_table_(Tab0) of
         {error, not_found} ->
             Hca = erlfdb_hca:create(<<"hca_table">>),
             TableId0 = erlfdb_hca:allocate(Hca, Db),
@@ -395,7 +402,7 @@ create_index_({_, index, {Pos, _}} = Tab, Db, #st{index = Indexes0} = Parent) ->
             Parent#st{index = Indexes}
     end.
 
-load_(Tab0) ->
+load_table_(Tab0) ->
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
     TabKey = <<"tbl_", Tab/binary, "_settings">>,
