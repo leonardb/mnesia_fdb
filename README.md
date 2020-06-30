@@ -72,7 +72,7 @@ to assign prefix values for tables as they are created. This prefix
 is then used for all keys within the table.
 
 Each record also uses a 'DataPrefix'
-- <<"d">> for set/ordered_set tables
+- <<"d">> for ordered_set tables
 - <<"b">> for bag tables
 - <<"p">> for 'parts' of values larger than 90Kb
 
@@ -106,22 +106,63 @@ Since the actual updates are performed after the 'point-of-no-return',
 returning an `error` result will cause mnesia to behave unpredictably,
 since the operations are expected to simply work.
 
+## Secondary indexes and selects
+
+Mnesia only uses secondary indexes when there is an explicit value match in the matchspec header.
+If a comparison is used in the matchspec guard, the secondary index is not used.
+
+Example of default Mnesia behavior:
+```
+given a table named `test` using record `#test{id :: integer{}, value :: any(), expires :: integer()}`
+with secondary indexes on `value` and `expires`.
+
+mnesia:dirty_select(test, [{#test{value = <<"test">>, _ = '_'}, [], ['$_']}]).
+This would use the secondary index on `value`
+
+mnesia:dirty_select(test, [{#test{value = '$1', _ = '_'}, [{'=:=','$1', <<"test">>}], ['$_']}]).
+This would *not* use the secondary index on `value`
+``` 
+
+In order to take advantage of FoundationDBs ordered keys mnesia_fdb will
+attempt to rewrite matchspecs, moving head matches into the guards, and then
+check if there is a usable secondary index.
+
+The current implementation is fairly naive in the planning of which index to use
+and could use further improvement.
+
+In order to facilitate better choices mnesia_fdb maintains internal counters of
+matched records for values on secondary indexes and will prefer an index with fewer
+matches.
+
+Additionally, mnesia_fdb will attempt to convert range type comparison operators into
+FoundationDb range boundaries to prevent full table scans.
+
+Example (mnesia_fdb behavior):
+```
+mnesia:dirty_select(test, [{#test{expires = '$1', _ = '_'}, [{'>=','$1', 500}, {'<','$1', 1000}], ['$_']}]).
+internally mnesia_fdb would convert this into a
+range query using the secondary index on `expires`
+```
+
 ## Caveats
 
-While `bag` tables are supported there is substantial runtime overhead as they
-require additional reads. There may be better ways to represent and process bag data.
+mnesia:table_info(Table, memory) returns an approximate size of the stored data in bytes.
+This does not include the size of indexes.
 
-The `mnesia:table_info(T, size)` call always returns zero for FoundationDB
-tables. FoundationDB itself does not track the number of elements in a table.
+The `mnesia:table_info(T, size)` call returns the count of records in a table.
+This should be correct for both ordered_set and bag tables.
+
+`bag` tables are supported and there is no significant runtime overhead since
+records are stored using an HCA and internally a range read is used for matching.
+
+Bag key is in form `sext:encode({<<"b">>, Key, Hca})` and the range read is performed
+using a chunked `erlfdb:get_range(Db, sext:encode({<<"b">>, Key, '_'}), sext:encode({<<"b">>, Key, <<"~">>}), Opts)`
 
 FoundationDB is limited with both key and value sizes. Keys < 10Kb and Values < 100Kb.
-In mnesia_fdb we have a hard limit of 9Kb for keys, and values are automatically split.
+In mnesia_fdb we have a hard limit of 9Kb for keys, while values are automatically split.
 
-Since secondary indexes in mnesia are stored as {{Value,Id}} keys, this makes
-supporting indexing of large values impossible.
-
-In order to support secondary indexes there is a hard limit on the sizes of values
-for indexed fields. This limit includes internal components.
+**IMPORTANT:** Since secondary indexes use the value as a component of the key, there are
+hard limits on the sizes of values for individual fields when a secondary index is defined.
 
 If a value for an indexed column exceeds the size limit an exception may occur or an informational error may be returned.
 

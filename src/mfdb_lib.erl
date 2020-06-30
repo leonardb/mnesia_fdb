@@ -16,7 +16,7 @@
          idx_matches/3,
          idx_count_key/2,
          table_count/1,
-         table_size/1,
+         table_data_size/1,
          update_counter/3]).
 
 -include("mfdb.hrl").
@@ -325,7 +325,7 @@ idx_matches(#st{db = DbOrTx, index = Indexes}, IdxPos, Key0) ->
             Count
     end.
 
-table_size(#st{db = DbOrTx, table_id = TableId}) ->
+table_data_size(#st{db = DbOrTx, table_id = TableId}) ->
     Key = tbl_size_key(TableId),
     R = case DbOrTx of
             ?IS_DB ->
@@ -337,7 +337,8 @@ table_size(#st{db = DbOrTx, table_id = TableId}) ->
         not_found ->
             0;
         <<Count:64/unsigned-little-integer>> ->
-            Count
+            %% Convert byes to words
+            erlang:round(Count / erlang:system_info(wordsize))
     end.
 
 table_count(#st{db = DbOrTx, table_id = TableId}) ->
@@ -445,11 +446,6 @@ save_parts_(Tx, TableId, PartId, PartInc, Tail) ->
     ok = erlfdb:wait(erlfdb:set(Tx, Key, Tail)),
     save_parts_(Tx, TableId, PartId, PartInc + 1, <<>>).
 
-db_or_tx_exec_(?IS_DB, Fun) ->
-    Fun();
-db_or_tx_exec_(?IS_TX, Fun) ->
-    erlfdb:wait(Fun()).
-
 update_counter(Tx, EncKey, Incr) ->
     %% Atomic counter increment
     %% Mnesia counters are dirty only, and cannot go below zero
@@ -502,8 +498,3 @@ update_counter(Tx, EncKey, Incr) ->
             NewVal = erlfdb:wait(erlfdb:get(Tx, EncKey)),
             {ok, NewVal}
     end.
-
-update_counter_tx_(?IS_DB = Db) ->
-    erlfdb:create_transaction(Db);
-update_counter_tx_(?IS_TX = Tx) ->
-    Tx.

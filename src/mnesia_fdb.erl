@@ -177,7 +177,7 @@ remove_aliases(_Aliases) ->
 %%
 semantics(_Alias, storage) -> disc_only_copies;
 semantics(_Alias, types  ) -> [ordered_set, bag];
-semantics(_Alias, index_types) -> [ordered, bag];
+semantics(_Alias, index_types) -> [ordered];
 semantics(_Alias, index_fun) -> fun index_f/4;
 semantics(_Alias, _) -> undefined.
 
@@ -321,12 +321,14 @@ delete_table(Alias, Tab) ->
             ok
     end.
 
-info(_Alias, _Tab, memory) ->
-    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, _Tab, memory]),
-    0;
-info(_Alias, _Tab, size) ->
-    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, _Tab, size]),
-    0;
+info(_Alias, Tab, memory) ->
+    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, Tab, memory]),
+    St = mfdb_manager:st(Tab),
+    mfdb_lib:table_data_size(St);
+info(_Alias, Tab, size) ->
+    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, Tab, size]),
+    St = mfdb_manager:st(Tab),
+    mfdb_lib:table_count(St);
 info(_Alias, Tab, Key) ->
     ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, Tab, Key]),
     mfdb_manager:read_info(Tab, Key, undefined).
