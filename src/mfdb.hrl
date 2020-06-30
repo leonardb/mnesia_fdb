@@ -37,6 +37,7 @@
 -define(IS_SS, {erlfdb_snapshot, _}).
 -define(IS_ITERATOR, {cont, #iter_st{}}).
 -define(GET_TX(SS), element(2, SS)).
+-define(SORT(L), lists:keysort(2, L)).
 
 -type db() :: {erlfdb_database, reference()}.
 -type tx() :: {erlfdb_transaction, reference()}.

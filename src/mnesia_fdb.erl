@@ -410,19 +410,21 @@ chunk_fun() ->
 
 %% low-level accessor callbacks.
 
-delete(_Alias, {_, index, _} = IdxTab, {{_,_}} = Key) ->
-    %% An index value is being removed and the Key added *CANNOT* exceed 9Kb
-    #st{table_id = TableId, type = Type} = St = mfdb_manager:st(IdxTab),
-    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), Key}),
-    ByteSize = byte_size(EncKey),
-    ?dbg("Key size: ~p", [ByteSize]),
-    case ByteSize of
-        X when X > 9216 ->
-            %% we never would have added this key
-            ok;
-        _ ->
-            do_delete(Key, St)
-    end;
+delete(_Alias, {_, index, _} = _IdxTab, {{_,_}} = _Key) ->
+    %% All secondary indexes removals are handled in the same transaction as the delete of the data
+    %%    %% An index value is being removed and the Key added *CANNOT* exceed 9Kb
+    %%    #st{table_id = TableId, type = Type} = St = mfdb_manager:st(IdxTab),
+    %%    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), Key}),
+    %%    ByteSize = byte_size(EncKey),
+    %%    ?dbg("Key size: ~p", [ByteSize]),
+    %%    case ByteSize of
+    %%        X when X > 9216 ->
+    %%            %% we never would have added this key
+    %%            ok;
+    %%        _ ->
+    %%            do_delete(Key, St)
+    %%    end;
+    ok;
 delete(Alias, Tab, Key) ->
     ?dbg("~p delete(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
     #st{} = St = mfdb_manager:st(Tab),
@@ -435,6 +437,9 @@ fixtable(_Alias, _Tab, _Bool) ->
 
 %% To save storage space, we avoid storing the key twice. The key
 %% in the record is replaced with []. It has to be put back in lookup/3.
+insert(_Alias, {_, index, _}, _Obj) ->
+    %% All secondary indexes writes are handled in the same transaction as the put of the data
+    ok;
 insert(_Alias, Tab0, Obj) ->
     ?dbg("~p : insert(~p, ~p, ~p)", [self(),_Alias, Tab0, Obj]),
     #st{} = St = mfdb_manager:st(Tab0),
@@ -610,7 +615,7 @@ select(Alias, Tab0, Ms0, Limit) when is_integer(Limit) ->
         {_, index, _Idx} ->
             ?dbg("Selecting from index: ~p~n", [_Idx]),
             #st{db = Db, table_id = TableId, tab = Tab, mtab = MTab, type = Type} = mfdb_manager:st(Tab0),
-            do_select(Db, TableId, Tab, MTab, Type, Ms0, Limit);
+            do_select(Db, TableId, Tab, MTab, Type, Ms0, undefined, undefined, Limit);
         _ ->
             {Guards, Binds, Ms} =
                 case Ms0 of
@@ -638,7 +643,7 @@ select(Alias, Tab0, Ms0, Limit) when is_integer(Limit) ->
                     do_indexed_select(Tab0, Ms, IdxParams, false, Limit);
                 no_index ->
                     ?dbg("no_index: ~n", []),
-                    do_select(Db, TableId, Tab, MTab, Type, Ms, Limit)
+                    do_select(Db, TableId, Tab, MTab, Type, Ms, PkStart, PkEnd, Limit)
             end
     end.
 
@@ -716,9 +721,14 @@ idx_sel(Guards, Indexes, #st{mtab = Tab, type = Type} = St0) ->
         [] ->
             no_index;
         IdxSel0 ->
-            {_, IdxId, IdxSel, _} = idx_pick([{idx_val_(I), Kp, I, IdxVCount} || {Kp, I, IdxVCount} <- IdxSel0]),
-            ?dbg("IdxSel: ~p~n", [IdxSel]),
-            {use_index, {IdxId, IdxSel}}
+            AvailIdx = [{idx_val_(I), Kp, I, IdxVCount} || {Kp, I, IdxVCount} <- IdxSel0, I =/= undefined],
+            case idx_pick(AvailIdx) of
+                undefined ->
+                    no_index;
+                {_, IdxId, IdxSel, _} ->
+                    ?dbg("IdxSel: ~p~n", [IdxSel]),
+                    {use_index, {IdxId, IdxSel}}
+            end
     end.
 
 idx_pick(Idx) ->
@@ -774,7 +784,12 @@ idx_pick([{IdxVal0, _, _, undefined} | Rest], {IdxVal1, _, _, undefined} = Idx)
 %% @end
 idx_table_params_(Guards, Keypos, TableId, Type) ->
     ?dbg("idx_table_params_(~p, ~p, ~p, ~p)", [Guards, Keypos, TableId, Type]),
-    idx_table_params_(Guards, Keypos, TableId, Type, undefined, undefined, {{'$1', '$2'}}, []).
+    case lists:keyfind(Keypos, 1, Guards) of
+        false ->
+            undefined;
+        _ ->
+            idx_table_params_(Guards, Keypos, TableId, Type, undefined, undefined, {{'$1', '$2'}}, [])
+    end.
 
 idx_table_params_([], _Keypos, TableId, Type, Start, End, Match, Guards) ->
     ?dbg("Start: ~p~nEnd:~p~nMatch:~p~nGuards:~p~n",[Start, End, Match, Guards]),
@@ -821,6 +836,7 @@ replace_(undefined, Val) ->
 replace_(Orig, _Val) ->
     Orig.
 
+v_(undefined) -> 0;
 v_({fdb, B}) when is_binary(B) -> 1; %% pre-calculated range
 v_({fdbr, B}) when is_binary(B) -> 2; %% pre-calculated range
 v_({{_, '$1'}}) -> 10;
@@ -834,6 +850,8 @@ v_(L) when is_list(L) ->
     %% number of guards
     length(L) * 0.5.
 
+idx_val_(undefined) ->
+    0;
 idx_val_({S,E,C,G}) ->
     lists:sum([v_(X) || X <- [S,E,C,G]]).
 
@@ -1171,10 +1189,10 @@ is_index(MTab) when is_atom(MTab) ->
 is_index(_MTab) ->
     true.
 
-do_select(Db, TableId, Tab, MTab, Type, MS, Limit) ->
-    do_select(Db, TableId, Tab, MTab, Type, MS, false, Limit).
+do_select(Db, TableId, Tab, MTab, Type, MS, PkStart, PkEnd, Limit) ->
+    do_select(Db, TableId, Tab, MTab, Type, MS, PkStart, PkEnd, false, Limit).
 
-do_select(Db, TableId, Tab, MTab, Type, MS, AccKeys, Limit) when is_boolean(AccKeys) ->
+do_select(Db, TableId, Tab, MTab, Type, MS, PkStart, PkEnd, AccKeys, Limit) when is_boolean(AccKeys) ->
     IsIndex = is_index(MTab),
     Keypat0 = keypat(MS, TableId, Type, IsIndex, 2),
     KeysOnly = needs_key_only(MS),
@@ -1186,6 +1204,11 @@ do_select(Db, TableId, Tab, MTab, Type, MS, AccKeys, Limit) when is_boolean(AccK
                      mfdb_lib:encode_prefix(TableId, {<<"b">>, ?FDB_WC, ?FDB_WC});
                  <<>> when IsIndex =:= true ->
                      mfdb_lib:encode_prefix(TableId, {<<"di">>, ?FDB_WC});
+                 _ when IsIndex =:= false andalso (PkStart =/= undefined orelse PkEnd =/= undefined) ->
+                     {range,
+                         pk_to_range(TableId, Type, start, PkStart),
+                         pk_to_range(TableId, Type, 'end', PkEnd)
+                     };
                  <<>> when IsIndex =:= false ->
                      mfdb_lib:encode_prefix(TableId, {<<"d">>, ?FDB_WC});
                  Keypat0 -> Keypat0
@@ -1197,12 +1220,25 @@ do_select(Db, TableId, Tab, MTab, Type, MS, AccKeys, Limit) when is_boolean(AccK
     Iter = iter_(Db, TableId, Tab, MTab, Type, Keypat, AccKeys, KeysOnly, CompiledMs, DataFun, InAcc, Limit),
     do_iter(InTransaction, Iter, Limit, []).
 
+pk_to_range(TableId, Type, start, {gt, X}) ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X}))};
+pk_to_range(TableId, Type, start, {gte, X}) ->
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X})};
+pk_to_range(TableId, Type, 'end', {lt, X}) ->
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X})};
+pk_to_range(TableId, Type, 'end', {lte, X}) ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X}))};
+pk_to_range(TableId, Type, start, _) ->
+    mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), ?FDB_WC});
+pk_to_range(TableId, Type, 'end', _) ->
+    mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), ?FDB_END}).
+
 do_iter(_InTransaction, '$end_of_table', Limit, Acc) when Limit =:= 0 ->
-    {Acc, '$end_of_table'};
+    {?SORT(Acc), '$end_of_table'};
 do_iter(_InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit =:= 0 ->
-    {lists:append(Acc, Data), '$end_of_table'};
+    {?SORT(lists:append(Acc, Data)), '$end_of_table'};
 do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit =:= 0 andalso is_function(Iter) ->
-    NAcc = lists:append(Acc, Data),
+    NAcc = ?SORT(lists:append(Acc, Data)),
     case Iter() of
         '$end_of_table' ->
             NAcc;
@@ -1214,19 +1250,19 @@ do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit =:= 0 andalso is_fu
 do_iter(InTransaction, '$end_of_table', Limit, Acc) when Limit > 0 ->
     case InTransaction of
         true ->
-            {Acc, '$end_of_table'};
+            {?SORT(Acc), '$end_of_table'};
         false ->
             Acc
     end;
 do_iter(InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit > 0 ->
     case InTransaction of
         true ->
-            {lists:append(Acc, Data), '$end_of_table'};
+            {?SORT(lists:append(Acc, Data)), '$end_of_table'};
         false ->
             lists:append(Acc, Data)
     end;
 do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit > 0 andalso is_function(Iter) ->
-    NAcc = lists:append(Acc, Data),
+    NAcc = ?SORT(lists:append(Acc, Data)),
     {NAcc, Iter}.
 
 needs_key_only([{HP,_,Body}]) ->
@@ -1421,7 +1457,10 @@ index_pfx(Type, start, V, true) ->
 index_pfx(Type, 'end', V, true) ->
     Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, {V, ?FDB_END}},
     ?dbg("~p prefix: ~p", [Type, Pfx]),
-    Pfx.
+    Pfx;
+index_pfx(_Type, _D, V, false) ->
+    %%io:format("Type: ~p D: ~p V: ~p~n", [Type, D, V]),
+    V.
 
 
 %% ----------------------------------------------------------------------------
@@ -1564,7 +1603,7 @@ iter_(?IS_DB = Db, TableId, Tab, MTab, Type, StartKey0, AccKeys, KeysOnly, Ms, D
              keys_only = KeysOnly,
              compiled_ms = Ms,
              start_key = SKey,
-             start_sel = erlfdb_key:to_selector(erlfdb_key:first_greater_than(SKey)),
+             start_sel = erlfdb_key:to_selector(SKey),
              end_sel = erlfdb_key:to_selector(EKey),
              limit = 100, %% we use a fix limit of 100 for the number of KVs to pull
              target_bytes = 0,
@@ -1746,7 +1785,7 @@ iter_start_end_(TableId, Type, StartKey0) ->
         {range, S0, E0} ->
             S = case S0 of
                     {S1k, S1} when S1k =:= fdb orelse S1k =:= fdbr ->
-                        S1;
+                        erlfdb_key:first_greater_or_equal(S1);
                     S0 ->
                         mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX(Type), S0})
                 end,
@@ -1758,7 +1797,7 @@ iter_start_end_(TableId, Type, StartKey0) ->
                 end,
             {S, E};
         StartKey0 ->
-            {StartKey0,
+            {erlfdb_key:first_greater_than(StartKey0),
              erlfdb_key:strinc(StartKey0)}
     end.
 

@@ -2,15 +2,19 @@
 
 A FoundationDB backend for Mnesia.
 
+**We're looking for contributors.**
+
 Permits Erlang/OTP applications to use FoundationDB as a backend for
 mnesia tables. It is based on Aeternity's `mnesia_rocksdb` which was based on Klarna's `mnesia_eleveldb`.
 
 Contributions and feedback are welcome.
 
+**WARNING** This is not considered safe for production and you should expect to lose data
+over versions since the keying formats are in flux as secondary index support is worked on.
+
 ### TODO / Help Wanted
-- [ ] Secondary Indexes
+- [ ] Secondary Indexes (in-progress)
 - [ ] Watch table definition keys for changes (eg, index added on a different node)
-- [ ] Investigate possibility of using the FDB directory layer rather than using packed prefixes
 - [ ] Performance improvements, especially in the iterator
 - [ ] Backup/restore
 

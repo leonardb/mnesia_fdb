@@ -26,7 +26,7 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_bag = HcaBag, hca
     put_bag_(Tx, TableId, MTab, HcaBag, HcaRef, tuple_to_list(Indexes), [{K, V}]);
 put(#st{db = ?IS_TX = Tx, table_id = TableId, mtab = MTab, hca_bag = HcaBag, hca_ref = HcaRef, index = Indexes, type = bag}, K, V) ->
     put_bag_(Tx, TableId, MTab, HcaBag, HcaRef, tuple_to_list(Indexes), [{K, V}]);
-put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef}, K, V0) when is_atom(MTab) ->
+put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, index = Indexes}, K, V0) when is_atom(MTab) ->
     %% Operation is on a data table
     EncKey = encode_key(TableId, {<<"d">>, K}),
     V1 = term_to_binary(V0),
@@ -58,22 +58,36 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef}, K,
         false ->
             erlfdb:wait(erlfdb:set(Tx, EncKey, V))
     end,
+    ok = add_data_indexes_(Tx, K, V0, tuple_to_list(Indexes)),
     erlfdb:wait(erlfdb:commit(Tx));
-put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = {_, index, _}}, {KeyValue, _RefId} = K, {[]}) ->
-    %% Operation is on an index
-    ?dbg("Encoding data index: (~p, ~p)", [TableId, {<<"di">>, K}]),
-    EncKey = encode_key(TableId, {<<"di">>, K}),
-    V = <<>>,
-    Tx = erlfdb:create_transaction(Db),
-    case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
-        not_found ->
-            %% New entry, so increment index value count
-            ok = erlfdb:wait(erlfdb:add(Tx, idx_count_key(TableId, KeyValue), 1));
-        _ ->
-            ok
-    end,
-    erlfdb:wait(erlfdb:set(Tx, EncKey, V)),
-    erlfdb:wait(erlfdb:commit(Tx)).
+put(#st{mtab = {_, index, _}}, _KV, _) ->
+    %% indexes handled in data put
+    ok.
+
+
+add_data_indexes_(_Tx, _K, _V0, []) ->
+    ok;
+add_data_indexes_(Tx, K, V0, [undefined | Rest]) ->
+    add_data_indexes_(Tx, K, V0, Rest);
+add_data_indexes_(Tx, K, V0, [#idx{table_id = TableId, pos = KPos} | Rest]) ->
+    KeyValue = element(KPos, V0),
+    EncKey = idx_count_key(TableId, KeyValue),
+    {ok, _} = update_counter(Tx, EncKey, 1),
+    ?dbg("Add data index ~p", [{<<"di">>, {KeyValue, K}}]),
+    ok = erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {<<"di">>, {KeyValue, K}}), <<>>)),
+    add_data_indexes_(Tx, K, V0, Rest).
+
+remove_data_indexes_(_Tx, _K, _V0, []) ->
+    ok;
+remove_data_indexes_(Tx, K, V0, [undefined | Rest]) ->
+    remove_data_indexes_(Tx, K, V0, Rest);
+remove_data_indexes_(Tx, K, V0, [#idx{table_id = TableId, pos = KPos} | Rest]) ->
+    KeyValue = element(KPos, V0),
+    EncKey = idx_count_key(TableId, KeyValue),
+    {ok, _} = update_counter(Tx, EncKey, -1),
+    ?dbg("Remove data index ~p", [{<<"di">>, {KeyValue, '_'}}]),
+    ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, encode_prefix(TableId, {<<"di">>, {KeyValue, '_'}}))),
+    remove_data_indexes_(Tx, K, V0, Rest).
 
 put_bag_(_Tx, _TableId, _MTab, _HcaBag, _HcaRef, _Indexes, []) ->
     ok;
@@ -150,7 +164,7 @@ bag_maybe_add_([{_EncKey, <<"mfdb_ref", _OldSize:32, MfdbRefPartId/binary>>} | R
                Size, NewKey, NewVal, NewEncVal)
   when is_atom(MTab) andalso Size > ?MAX_VALUE_SIZE ->
     %% References large record with multiple parts
-    OldVal = bag_parts_value_(MfdbRefPartId, TableId, Tx),
+    OldVal = parts_value_(MfdbRefPartId, TableId, Tx),
     case OldVal =:= NewEncVal of
         true ->
             ?dbg("Bag large value already exists: ~p", [NewKey]),
@@ -179,7 +193,7 @@ bag_maybe_add_([{_EncKey, EncVal} | Rest],
                            Size, NewKey, NewVal, NewEncVal)
     end.
 
-bag_parts_value_(MfdbRefPartId, TableId, Tx) ->
+parts_value_(MfdbRefPartId, TableId, Tx) ->
     {<<"p">>, PartHcaVal} = sext:decode(MfdbRefPartId),
     Start = encode_prefix(TableId, {<<"p">>, PartHcaVal, <<"_">>, '_'}),
     Parts = erlfdb:wait(erlfdb:get_range_startswith(Tx, Start)),
@@ -198,66 +212,55 @@ bag_set_(Tx, TableId, EncKey, EncVal, HcaRef, Size) ->
             ok = erlfdb:wait(erlfdb:set(Tx, EncKey, EncVal))
     end.
 
-delete(#st{db = Db, table_id = TableId, mtab = MTab, index = Indexes, type = bag}, K) ->
+delete(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, index = Indexes, type = bag}, K) ->
     %% When db is a transaction we do _NOT_ commit, it's the caller's responsibility
     Tx = erlfdb:create_transaction(Db),
     R = do_delete_bag(Tx, TableId, MTab, tuple_to_list(Indexes), K),
     erlfdb:wait(erlfdb:commit(Tx)),
     R;
-delete(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab}, K) when is_atom(MTab) ->
+delete(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, index = Indexes}, K) when is_atom(MTab) ->
     %% deleting a data item
-    EncKey = encode_key(TableId, {<<"d">>, K}),
-    case erlfdb:get(Db, EncKey) of
-        not_found ->
-            ok;
-        <<"mfdb_ref", OldSize:32, MfdbRefPartId/binary>> ->
-            %% decrement size
-            erlfdb:add(Db, tbl_size_key(TableId), OldSize * -1),
-            %% Remove parts of large value
-            {<<"p">>, PartHcaVal} = sext:decode(MfdbRefPartId),
-            Start = encode_prefix(TableId, {<<"p">>, PartHcaVal, <<"_">>, '_'}),
-            ok = erlfdb:clear_range_startswith(Db, Start);
-        <<OldSize:32, _/binary>> ->
-            %% decrement size
-            erlfdb:add(Db, tbl_size_key(TableId), OldSize * -1),
-            ok
-    end,
-    %% decrement item count
-    erlfdb:add(Db, tbl_count_key(TableId), -1),
-    ok = erlfdb:clear(Db, EncKey);
-delete(#st{db = ?IS_DB = Db, table_id = TableId, mtab = {_, index, _}}, {KeyVal, _KeyRef} = Key) ->
-    %% deleting an index item
-    EncKey = encode_key(TableId, {<<"d">>, Key}),
-    case erlfdb:get(Db, EncKey) of
-        not_found ->
-            ok;
-        _ ->
-            %% decrement count of index items for value
-            erlfdb:add(Db, idx_count_key(TableId, KeyVal), -1),
-            ok
-    end,
-    ok = erlfdb:clear(Db, EncKey);
-delete(#st{db = ?IS_TX = Tx, table_id = TableId}, K) ->
+    Tx = erlfdb:create_transaction(Db),
+    do_delete_data_(Tx, TableId, tuple_to_list(Indexes), true, K);
+delete(#st{db = ?IS_TX = Tx, table_id = TableId, index = Indexes}, K) ->
     %% When db is a transaction we do _NOT_ commit, it's the caller's responsibility
+    do_delete_data_(Tx, TableId, tuple_to_list(Indexes), false, K);
+delete(#st{mtab = {_, index, _}}, _Key) ->
+    %% noop - indexes handled in data handlers
+    ok.
+
+do_delete_data_(Tx, TableId, Indexes, DoCommit, K) ->
     EncKey = encode_key(TableId, {<<"d">>, K}),
     case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
         not_found ->
             ok;
         <<"mfdb_ref", OldSize:32, MfdbRefPartId/binary>> ->
             %% decrement size
-            erlfdb:add(Tx, tbl_size_key(TableId), OldSize * -1),
+            <<_:32, V0/binary>> = parts_value_(MfdbRefPartId, TableId, Tx),
+            erlfdb:wait(erlfdb:add(Tx, tbl_size_key(TableId), OldSize * -1)),
             %% Remove parts of large value
             {<<"p">>, PartHcaVal} = sext:decode(MfdbRefPartId),
             Start = encode_prefix(TableId, {<<"p">>, PartHcaVal, <<"_">>, '_'}),
-            ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, Start));
-        <<OldSize:32, _EncVal/binary>> ->
+            ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, Start)),
+            %% decrement item count
+            erlfdb:add(Tx, tbl_count_key(TableId), -1),
+            %% Remove index
+            ok = remove_data_indexes_(Tx, K, binary_to_term(V0), tuple_to_list(Indexes));
+        <<OldSize:32, EncVal/binary>> ->
             %% decrement size
             erlfdb:add(Tx, tbl_size_key(TableId), OldSize * -1),
-            ok
+            %% decrement item count
+            erlfdb:add(Tx, tbl_count_key(TableId), -1),
+            %% Remove index
+            ok = remove_data_indexes_(Tx, K, binary_to_term(EncVal), tuple_to_list(Indexes))
     end,
-    %% decrement item count
-    erlfdb:add(Tx, tbl_count_key(TableId), -1),
-    ok = erlfdb:wait(erlfdb:clear(Tx, EncKey)).
+    ok = erlfdb:wait(erlfdb:clear(Tx, EncKey)),
+    case DoCommit of
+        true ->
+            ok = erlfdb:wait(erlfdb:commit(Tx));
+        false ->
+            ok
+    end.
 
 do_delete_bag(_Tx, _TableId, {_, index, _}, _Indexes, _K) ->
     %% we handle Bag indexes in the data put/delete operations
@@ -403,7 +406,7 @@ decode_bag_key(TableId, <<S:8, R/binary>>) ->
 decode_val(_Db, _TableId, <<>>) ->
     <<>>;
 decode_val(Db, TableId, <<"mfdb_ref", _OldSize:32, MfdbRefPartId/binary>>) ->
-    PartsVal = bag_parts_value_(MfdbRefPartId, TableId, Db),
+    PartsVal = parts_value_(MfdbRefPartId, TableId, Db),
     <<_:32, Val>> = bin_join_parts(PartsVal),
     binary_to_term(Val);
 decode_val(_Db, _TableId, <<_:32, CodedVal/binary>>) ->
