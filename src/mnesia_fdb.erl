@@ -729,13 +729,13 @@ idx_pick([First | Rest], undefined) ->
 idx_pick([{_IdxVal0, _, _, ValCount0} = Idx | Rest], {_IdxVal1, _, _, ValCount1})
     when is_integer(ValCount0) andalso
          is_integer(ValCount1) andalso
-         ValCount0 > ValCount1 ->
+         ValCount0 < ValCount1 ->
     %% less keys to scan through
     idx_pick(Rest, Idx);
 idx_pick([{_IdxVal0, _, _, ValCount0} | Rest], {_IdxVal1, _, _, ValCount1} = Idx)
     when is_integer(ValCount0) andalso
          is_integer(ValCount1) andalso
-         ValCount0 < ValCount1 ->
+         ValCount1 < ValCount0 ->
     idx_pick(Rest, Idx);
 idx_pick([{IdxVal0, _, _, ValCount0} | Rest], {IdxVal1, _, _, ValCount1} = Idx)
     when is_integer(ValCount0) andalso
@@ -1029,6 +1029,9 @@ do_fold_delete2_(#st{table_id = TableId, mtab = MTab} = St, [{EncKey, EncV} | Re
 %% ----------------------------------------------------------------------------
 %% PRIVATE SELECT MACHINERY
 %% ----------------------------------------------------------------------------
+%% 2-step select using the picked index for the inner select from an index table
+%% and wrapping in an outer select function to allow matching other guards
+%% @todo: use multiple indexes, possibly with a parallel query to get all ids, and use intersection for final id list
 do_indexed_select(Tab0, MS, {IdxPos, {Start, End, Match, Guard}}, AccKeys, Limit) when is_boolean(AccKeys) ->
     #st{db = Db, table_id = OTableId, mtab = OMTab, type = Type, index = Indexes} = mfdb_manager:st(Tab0),
     #idx{table_id = ITableId, tab = ITab, mtab = IMTab} = element(IdxPos, Indexes),
