@@ -9,14 +9,13 @@ mnesia tables. It is based on Aeternity's `mnesia_rocksdb` which was based on Kl
 
 Contributions and feedback are welcome.
 
-**WARNING** This is not considered safe for production and you should expect to lose data
-over versions since the keying formats are in flux as secondary index support is worked on.
+**WARNING** This is not considered safe for production yet.
 
 ### TODO / Help Wanted
-- [ ] Secondary Indexes (in-progress)
 - [ ] Watch table definition keys for changes (eg, index added on a different node)
 - [ ] Performance improvements, especially in the iterator
 - [ ] Backup/restore
+- [ ] Primary/Secondary node concept. Controlling table creation/deletion from a single node
 
 
 ## FoundationDB
@@ -77,16 +76,12 @@ is then used for all keys within the table.
 
 Each record also uses a 'DataPrefix'
 - <<"d">> for ordered_set tables
-- <<"b">> for bag tables
+- <<"di">> for data indexes
 - <<"p">> for 'parts' of values larger than 90Kb
 
-### Key internals (set/ordered_set)
- - set/ordered_set keys are encoded using `sext:encode({TableId, <<"d">>, Key})`
+### Key internals (ordered_set)
+ - ordered_set keys are encoded using `sext:encode({TableId, <<"d">>, Key})`
  
-### Key internals (bag)
-  - bag tables use an HCA pre table for assigning suffixes to duplicate keys
-  - keys are encoded using `sext:encode({TableId, <<"b">>, Key, BagHac})`
-
 ### Large values
  FoundationDb limits the size of values to 100Kb. `mnesia_fdb` splits larger values into 90Kb chunks.
  They are stored using a table specific Parts HCA for assigning references.
@@ -156,11 +151,7 @@ This does not include the size of indexes.
 The `mnesia:table_info(T, size)` call returns the count of records in a table.
 This should be correct for both ordered_set and bag tables.
 
-`bag` tables are supported and there is no significant runtime overhead since
-records are stored using an HCA and internally a range read is used for matching.
-
-Bag key is in form `sext:encode({<<"b">>, Key, Hca})` and the range read is performed
-using a chunked `erlfdb:get_range(Db, sext:encode({<<"b">>, Key, '_'}), sext:encode({<<"b">>, Key, <<"~">>}), Opts)`
+`bag` tables are *not* supported.
 
 FoundationDB is limited with both key and value sizes. Keys < 10Kb and Values < 100Kb.
 In mnesia_fdb we have a hard limit of 9Kb for keys, while values are automatically split.

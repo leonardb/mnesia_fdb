@@ -215,7 +215,7 @@ check_definition(Alias, Tab, Nodes, Props) ->
             Error
     end.
 
-check_definition_entry(_Tab, _Id, {type, ordered_set} = P) ->
+check_definition_entry(_Tab, _Id, {type, ordered_set = T} = P) ->
     ?dbg("~p: check_definition_entry(~p, ~p, ~p);~n Trace: ~s~n",
          [self(), _Tab, _Id, {type, T}, pp_stack()]),
     P;
