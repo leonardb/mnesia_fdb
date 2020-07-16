@@ -29,7 +29,7 @@
 -define(TABLE_PREFIX, <<"tbl_">>).
 -define(FDB_WC, '_').
 -define(FDB_END, <<"~">>).
--define(DATA_PREFIX(T), case T of bag -> <<"b">>; _ -> <<"d">> end).
+-define(DATA_PREFIX, <<"d">>).
 -define(IS_DB, {erlfdb_database, _}).
 -define(IS_TX, {erlfdb_transaction, _}).
 -define(IS_FUTURE, {erlfdb_future, _, _}).
@@ -66,7 +66,6 @@
         {
          tab                            :: binary(),
          mtab                           :: any(), %% mnesia table spec
-         type                   = set   :: set | ordered_set | bag,
          alias                          :: atom(),
          record_name                    :: atom(),
          attributes                     :: list(atom()),
@@ -75,7 +74,6 @@
          on_write_error_store   = ?WRITE_ERR_STORE_DEFAULT :: on_write_error_store(),
          db                             :: db(),
          table_id                       :: binary(),
-         hca_bag,  %% opaque :: #erlfdb_hca{} record used for bag type table keys :: erlfdb_hca:create(<<"hca_", TableId/binary>>).
          hca_ref,   %% opaque :: #erlfdb_hca{} record used for mfdb_part() keys    :: erlfdb_hca:create(<<"parts_", TableId/binary>>).
          info                   = []
         }).
@@ -89,7 +87,6 @@
          table_id :: binary(),
          tab :: binary(),
          mtab :: any(), %% mnesia table id
-         type :: atom(),
          data_count = 0 :: non_neg_integer(),
          data_limit = 0 :: non_neg_integer(),
          data_acc = [],
