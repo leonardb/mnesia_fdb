@@ -410,21 +410,6 @@ chunk_fun() ->
 
 %% low-level accessor callbacks.
 
-delete(_Alias, {_, index, _} = _IdxTab, {{_,_}} = _Key) ->
-    %% All secondary indexes removals are handled in the same transaction as the delete of the data
-    %%    %% An index value is being removed and the Key added *CANNOT* exceed 9Kb
-    %%    #st{table_id = TableId, type = Type} = St = mfdb_manager:st(IdxTab),
-    %%    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), Key}),
-    %%    ByteSize = byte_size(EncKey),
-    %%    ?dbg("Key size: ~p", [ByteSize]),
-    %%    case ByteSize of
-    %%        X when X > 9216 ->
-    %%            %% we never would have added this key
-    %%            ok;
-    %%        _ ->
-    %%            do_delete(Key, St)
-    %%    end;
-    ok;
 delete(Alias, Tab, Key) ->
     ?dbg("~p delete(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
     #st{} = St = mfdb_manager:st(Tab),
@@ -437,9 +422,6 @@ fixtable(_Alias, _Tab, _Bool) ->
 
 %% To save storage space, we avoid storing the key twice. The key
 %% in the record is replaced with []. It has to be put back in lookup/3.
-insert(_Alias, {_, index, _}, _Obj) ->
-    %% All secondary indexes writes are handled in the same transaction as the put of the data
-    ok;
 insert(_Alias, Tab0, Obj) ->
     ?dbg("~p : insert(~p, ~p, ~p)", [self(),_Alias, Tab0, Obj]),
     #st{} = St = mfdb_manager:st(Tab0),
@@ -642,7 +624,7 @@ select(Alias, Tab0, Ms0, Limit) when is_integer(Limit) ->
                          [Tab0, Ms, IdxParams, Limit]),
                     do_indexed_select(Tab0, Ms, IdxParams, false, Limit);
                 no_index ->
-                    ?dbg("no_index: ~n", []),
+                    ?dbg("no_index: using MS ~p~n", [Ms]),
                     do_select(Db, TableId, Tab, MTab, Type, Ms, PkStart, PkEnd, Limit)
             end
     end.
@@ -1220,18 +1202,32 @@ do_select(Db, TableId, Tab, MTab, Type, MS, PkStart, PkEnd, AccKeys, Limit) when
     Iter = iter_(Db, TableId, Tab, MTab, Type, Keypat, AccKeys, KeysOnly, CompiledMs, DataFun, InAcc, Limit),
     do_iter(InTransaction, Iter, Limit, []).
 
-pk_to_range(TableId, Type, start, {gt, X}) ->
+%% Bag type tables
+pk_to_range(TableId, Type, start, {gt, X}) when Type =:= bag ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X, ?FDB_WC}))};
+pk_to_range(TableId, Type, start, {gte, X}) when Type =:= bag ->
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X, ?FDB_WC})};
+pk_to_range(TableId, Type, 'end', {lt, X}) when Type =:= bag ->
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X, ?FDB_END})};
+pk_to_range(TableId, Type, 'end', {lte, X}) when Type =:= bag ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X, ?FDB_END}))};
+pk_to_range(TableId, Type, start, _) when Type =:= bag ->
+    {fdbr, mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX(Type), ?FDB_WC, ?FDB_WC})};
+pk_to_range(TableId, Type, 'end', _) when Type =:= bag ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX(Type), ?FDB_END, ?FDB_END}))};
+%% ordered set tables
+pk_to_range(TableId, Type, start, {gt, X}) when Type =/= bag ->
     {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X}))};
-pk_to_range(TableId, Type, start, {gte, X}) ->
+pk_to_range(TableId, Type, start, {gte, X}) when Type =/= bag ->
     {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X})};
-pk_to_range(TableId, Type, 'end', {lt, X}) ->
+pk_to_range(TableId, Type, 'end', {lt, X}) when Type =/= bag ->
     {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X})};
-pk_to_range(TableId, Type, 'end', {lte, X}) ->
+pk_to_range(TableId, Type, 'end', {lte, X}) when Type =/= bag ->
     {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), X}))};
-pk_to_range(TableId, Type, start, _) ->
-    mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), ?FDB_WC});
-pk_to_range(TableId, Type, 'end', _) ->
-    mfdb_lib:encode_key(TableId, {?DATA_PREFIX(Type), ?FDB_END}).
+pk_to_range(TableId, Type, start, _) when Type =/= bag ->
+    {fdbr, mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX(Type), ?FDB_WC})};
+pk_to_range(TableId, Type, 'end', _) when Type =/= bag ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX(Type), ?FDB_END}))}.
 
 do_iter(_InTransaction, '$end_of_table', Limit, Acc) when Limit =:= 0 ->
     {?SORT(Acc), '$end_of_table'};
@@ -1417,7 +1413,7 @@ index_pfx(bag = Type, start, ?FDB_WC, true) ->
     ?dbg("Bag prefix: ~p", [Pfx]),
     Pfx;
 index_pfx(bag = Type, 'end', ?FDB_END, true) ->
-    Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, ?FDB_END, ?FDB_WC},
+    Pfx = {<<(?DATA_PREFIX(Type))/binary, "i">>, ?FDB_END, ?FDB_END},
     ?dbg("Bag prefix: ~p", [Pfx]),
     Pfx;
 index_pfx(bag = Type, start, Val, true) when is_atom(Val) ->
