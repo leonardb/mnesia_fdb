@@ -21,11 +21,15 @@
 -define(KB, 1024).
 -define(MB, 1024 * 1024).
 -define(GB, 1024 * 1024 * 1024).
+
+%% FDB has limits on key and value sizes
+-define(MAX_VALUE_SIZE, 92160). %% 90Kb in bytes
+-define(MAX_KEY_SIZE, 9216). %% 9Kb in bytes
+
 -define(TABLE_PREFIX, <<"tbl_">>).
 -define(FDB_WC, '_').
 -define(FDB_END, <<"~">>).
--define(MAX_VALUE_SIZE, 92160). %% 90Kb in Bytes
--define(DATA_PREFIX(T), case T of bag -> <<"b">>; _ -> <<"d">> end).
+-define(DATA_PREFIX, <<"d">>).
 -define(IS_DB, {erlfdb_database, _}).
 -define(IS_TX, {erlfdb_transaction, _}).
 -define(IS_FUTURE, {erlfdb_future, _, _}).
@@ -33,10 +37,12 @@
 -define(IS_SS, {erlfdb_snapshot, _}).
 -define(IS_ITERATOR, {cont, #iter_st{}}).
 -define(GET_TX(SS), element(2, SS)).
+-define(SORT(L), lists:keysort(2, L)).
 
 -type db() :: {erlfdb_database, reference()}.
 -type tx() :: {erlfdb_transaction, reference()}.
 -type selector() :: {binary, gteq | gt | lteq | lt}.
+-type idx() :: {atom(), index, {pos_integer(), atom()}}.
 
 -record(conn,
         {
@@ -47,36 +53,46 @@
          tls_cert_path  :: undefined | binary()     %% Absolute path, incl filename, of SSL Certificate
         }).
 
+-record(idx,
+        {
+         mtab                       :: idx(), %% keep in 1st position as unique key
+         tab                        :: binary(),
+         table_id                   :: binary(),
+         pos                        :: integer(),
+         index_consistent = false   :: boolean()
+        }).
+
 -record(st,
         {
-         tab                   :: atom(),
-         type                   = set   :: set | ordered_set | bag,
+         tab                            :: binary(),
+         mtab                           :: any(), %% mnesia table spec
          alias                          :: atom(),
          record_name                    :: atom(),
          attributes                     :: list(atom()),
-         index                  = []    :: list(pos_integer()),
+         index                          :: tuple(),
          on_write_error         = ?WRITE_ERR_DEFAULT :: on_write_error(),
          on_write_error_store   = ?WRITE_ERR_STORE_DEFAULT :: on_write_error_store(),
          db                             :: db(),
-         tab_bin                        :: binary(),
          table_id                       :: binary(),
-         hca_bag,  %% opaque :: #erlfdb_hca{} record used for bag type table keys :: erlfdb_hca:create(<<"hca_", TableId/binary>>).
-         hca_ref   %% opaque :: #erlfdb_hca{} record used for mfdb_part() keys    :: erlfdb_hca:create(<<"parts_", TableId/binary>>).
+         hca_ref,   %% opaque :: #erlfdb_hca{} record used for mfdb_part() keys    :: erlfdb_hca:create(<<"parts_", TableId/binary>>).
+         info                   = []
         }).
+
+-record(info, {k, v}).
 
 -record(iter_st,
         {
          db :: db(),
          tx :: tx(),
          table_id :: binary(),
-         tab :: atom(),
-         type :: atom(),
+         tab :: binary(),
+         mtab :: any(), %% mnesia table id
          data_count = 0 :: non_neg_integer(),
          data_limit = 0 :: non_neg_integer(),
          data_acc = [],
          data_fun :: undefined | function(),
-         return_keys_only = false :: boolean(),
-         need_keys_only = false :: boolean(),
+         acc_keys = false :: boolean(),
+         keys_only = false :: boolean(),
          compiled_ms,
          start_key :: any(),
          start_sel :: selector(),
@@ -88,3 +104,16 @@
          snapshot :: boolean(),
          reverse :: 1 | 0
         }).
+
+%% enable debugging messages through mnesia:set_debug_level(debug)
+-ifndef(MNESIA_FDB_NO_DBG).
+-define(dbg(Fmt, Args),
+        %% avoid evaluating Args if the message will be dropped anyway
+        case mnesia_monitor:get_env(debug) of
+            none -> ok;
+            verbose -> ok;
+            _ -> mnesia_lib:dbg_out("~p:~p: "++(Fmt)++"~n",[?MODULE,?LINE|Args])
+        end).
+-else.
+-define(dbg(Fmt, Args), ok).
+-endif.

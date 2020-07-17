@@ -41,4 +41,4 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    {ok, { {one_for_one, 5, 10}, [?CHILD(mnesia_fdb_manager, worker)]} }.
+    {ok, { {one_for_one, 5, 10}, [?CHILD(mfdb_manager, worker)]} }.

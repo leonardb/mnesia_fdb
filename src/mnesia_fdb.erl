@@ -41,16 +41,6 @@
 -export([register/0,
          register/1,
          default_alias/0]).
-
-%%
-%% DEBUG API
-%%
-
--export([show_table/1,
-         show_table/2,
-         show_table/3,
-         fold/6]).
-
 %%
 %% BACKEND CALLBACKS
 %%
@@ -108,40 +98,12 @@
 
 -export([ix_prefixes/3]).
 
-%% exported for manual testing
--export([iter_/10, iter_/11, iter_cont/1, select_return_keysonly_/1]).
+%%
+%% DEBUG API
+%%
+-export([iter_/10, iter_/11, iter_cont/1, do_indexed_select/5]).
 
-%% ----------------------------------------------------------------------------
-%% DEFINES
-%% ----------------------------------------------------------------------------
-
-%% Data and meta data (a.k.a. info) are stored in the same table.
-%% This is a table of the first byte in data
-%% 0    = before meta data
-%% 1    = meta data
-%% 2    = before data
-%% >= 8 = data
-
--define(INFO_START, 0).
--define(INFO_TAG, 1).
--define(DATA_START, 2).
--define(BAG_CNT, 32).   % Number of bits used for bag object counter
--define(MAX_BAG, 16#FFFFFFFF).
-
-%% enable debugging messages through mnesia:set_debug_level(debug)
--ifndef(MNESIA_FDB_NO_DBG).
--define(dbg(Fmt, Args),
-        %% avoid evaluating Args if the message will be dropped anyway
-        case mnesia_monitor:get_env(debug) of
-            none -> ok;
-            verbose -> ok;
-            _ -> mnesia_lib:dbg_out("~p:~p: "++(Fmt)++"~n",[?MODULE,?LINE|Args])
-        end).
--else.
--define(dbg(Fmt, Args), ok).
--endif.
-
--include("mnesia_fdb.hrl").
+-include("mfdb.hrl").
 
 %% ----------------------------------------------------------------------------
 %% CONVENIENCE API
@@ -164,44 +126,6 @@ register(Alias) ->
 
 default_alias() ->
     fdb_copies.
-
-%% ----------------------------------------------------------------------------
-%% DEBUG API
-%% ----------------------------------------------------------------------------
-
-%% A debug function that shows the fdb table content
-show_table(Tab) ->
-    show_table(default_alias(), Tab).
-
-show_table(Alias, Tab) ->
-    show_table(Alias, Tab, 100).
-
-show_table(_Alias, Tab0, Limit) ->
-    #st{db = Db, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab0),
-    DPfx = ?DATA_PREFIX(Type),
-    StartKey = sext:prefix({TableId, DPfx, ?FDB_WC}),
-    i_show_table(Db, TableId, StartKey, Limit).
-
-%% PRIVATE
-
-i_show_table(_, _, _, 0) ->
-    ?dbg("iShow table",[]),
-    {error, skipped_some};
-i_show_table(Db, TableId, Start, Limit) ->
-    ?dbg("iShow table: ~p ~p ~p",[Db, Start, Limit]),
-    case erlfdb:get_range_startswith(Db, Start, [{limit, Limit}]) of
-        [] ->
-            ok;
-        Rows ->
-            [begin
-                 K = mnesia_fdb_lib:decode_key(EncKey, TableId),
-                 V = decode_val(Db, EncVal),
-                 Val = setelement(2, V, K),
-                 io:fwrite("~p~n", [Val])
-             end || {EncKey, EncVal} <- Rows],
-            ok
-    end.
-
 
 %% ----------------------------------------------------------------------------
 %% BACKEND CALLBACKS
@@ -235,26 +159,26 @@ remove_aliases(_Aliases) ->
 %%    undefined.
 %%
 semantics(_Alias, storage) -> disc_only_copies;
-semantics(_Alias, types  ) -> [set, ordered_set, bag];
+semantics(_Alias, types  ) -> [ordered_set];
 semantics(_Alias, index_types) -> [ordered];
 semantics(_Alias, index_fun) -> fun index_f/4;
 semantics(_Alias, _) -> undefined.
 
-is_index_consistent(Alias, {Tab, index, PosInfo}) ->
-    ?dbg("is_index_consistent ~p ~p ",[Alias, {Tab, index, PosInfo}]),
-    case info(Alias, Tab, {index_consistent, PosInfo}) of
+is_index_consistent(Alias, Tab) ->
+    ?dbg("is_index_consistent ~p ~p ",[Alias, Tab]),
+    case info(Alias, Tab, index_consistent) of
         true -> true;
         _ -> false
     end.
 
-index_is_consistent(Alias, {Tab, index, PosInfo}, Bool)
+index_is_consistent(Alias, Tab, Bool)
   when is_boolean(Bool) ->
-    ?dbg("index_is_consistent ~p ~p ~p",[Alias, {Tab, index, PosInfo}, Bool]),
-    write_info(Alias, Tab, {index_consistent, PosInfo}, Bool).
+    ?dbg("index_is_consistent ~p ~p ~p",[Alias, Tab, Bool]),
+    mfdb_manager:write_info(Tab, index_consistent, Bool).
 
 %% PRIVATE FUN
 index_f(_Alias, _Tab, Pos, Obj) ->
-    ?dbg("index_f ~p",[{_Alias, _Tab, Pos, Obj}]),
+    %% ?dbg("index_f ~p",[{_Alias, _Tab, Pos, Obj}]),
     [element(Pos, Obj)].
 
 ix_prefixes(_Tab, _Pos, Obj) ->
@@ -291,7 +215,7 @@ check_definition(Alias, Tab, Nodes, Props) ->
             Error
     end.
 
-check_definition_entry(_Tab, _Id, {type, T} = P) when T==set; T==ordered_set; T==bag ->
+check_definition_entry(_Tab, _Id, {type, ordered_set = T} = P) ->
     ?dbg("~p: check_definition_entry(~p, ~p, ~p);~n Trace: ~s~n",
          [self(), _Tab, _Id, {type, T}, pp_stack()]),
     P;
@@ -321,15 +245,14 @@ check_definition_entry(_Tab, _Id, P) ->
 
 create_table(_Alias, Tab, Props) ->
     ?dbg("~p :: create_table(~p, ~p, ~p)", [self(), _Alias, Tab, Props]),
-    mnesia_fdb_manager:create(Tab, Props).
+    mfdb_manager:create_table(Tab, Props).
 
 load_table(_Alias, Tab, restore, Props) ->
-    mnesia_fdb_manager:create(Tab, Props);
-load_table(_Alias, Tab, _LoadReason, _Opts) ->
-    ?dbg("~p :: load_table(~p, ~p, ~p, ~p)", [self(), _Alias, Tab, _LoadReason, _Opts]),
-    case mnesia_fdb_manager:st(Tab) of
+    mfdb_manager:create_table(Tab, Props);
+load_table(_Alias, Tab, LoadReason, Opts) ->
+    ?dbg("~p :: load_table(~p, ~p, ~p, ~p)", [self(), _Alias, Tab, LoadReason, Opts]),
+    case mfdb_manager:st(Tab) of
         #st{} ->
-            %% Table is loaded
             ok;
         _ ->
             badarg
@@ -374,26 +297,24 @@ sync_close_table(Alias, Tab) ->
 delete_table(Alias, Tab) ->
     ?dbg("~p: delete_table(~p, ~p);~n Trace: ~s~n",
          [self(), Alias, Tab, pp_stack()]),
-    case mnesia_fdb_manager:load_if_exists(Tab) of
+    case mfdb_manager:load_if_exists(Tab) of
         ok ->
-            mnesia_fdb_manager:delete(Tab);
+            mfdb_manager:delete_table(Tab);
         {error, not_found} ->
             ok
     end.
 
-info(_Alias, _Tab, memory) ->
-    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, _Tab, memory]),
-    0;
-info(_Alias, _Tab, size) ->
-    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, _Tab, size]),
-    0;
-info(_Alias, _Tab, _Item) ->
-    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, _Tab, _Item]),
-    undefined.
-
-write_info(_Alias, _Tab, _Key, _Value) ->
-    ?dbg("~p: write_info(~p, ~p, ~p, ~p)~n", [self(), _Alias, _Tab, _Key, _Value]),
-    ok.
+info(_Alias, Tab, memory) ->
+    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, Tab, memory]),
+    St = mfdb_manager:st(Tab),
+    mfdb_lib:table_data_size(St);
+info(_Alias, Tab, size) ->
+    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, Tab, size]),
+    St = mfdb_manager:st(Tab),
+    mfdb_lib:table_count(St);
+info(_Alias, Tab, Key) ->
+    ?dbg("~p: info(~p, ~p, ~p)~n", [self(), _Alias, Tab, Key]),
+    mfdb_manager:read_info(Tab, Key, undefined).
 
 %% table sync calls
 
@@ -474,7 +395,7 @@ chunk_fun() ->
 
 delete(Alias, Tab, Key) ->
     ?dbg("~p delete(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
-    #st{} = St = mnesia_fdb_manager:st(Tab),
+    #st{} = St = mfdb_manager:st(Tab),
     do_delete(Key, St).
 
 %% Not relevant for an ordered_set
@@ -486,9 +407,8 @@ fixtable(_Alias, _Tab, _Bool) ->
 %% in the record is replaced with []. It has to be put back in lookup/3.
 insert(_Alias, Tab0, Obj) ->
     ?dbg("~p : insert(~p, ~p, ~p)", [self(),_Alias, Tab0, Obj]),
-    #st{tab = Tab} = St = mnesia_fdb_manager:st(Tab0),
-    %% St = call(Alias, Tab, get_st),
-    Pos = keypos(Tab),
+    #st{} = St = mfdb_manager:st(Tab0),
+    Pos = keypos(Tab0),
     Key = element(Pos, Obj),
     Val = setelement(Pos, Obj, []),
     do_insert(Key, Val, St).
@@ -497,47 +417,28 @@ insert(_Alias, Tab0, Obj) ->
 %% into the found record.
 lookup(Alias, Tab0, Key) ->
     ?dbg("~p : lookup(~p, ~p, ~p)", [self(), Alias, Tab0, Key]),
-    #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab0),
-    case Type of
-        bag ->
-            lookup_bag(Db, TableId, Key, keypos(Tab0));
-        _ ->
-            EncKey = sext:encode({TableId, ?DATA_PREFIX(Type), Key}),
+    #st{db = Db, mtab = Tab0, table_id = TableId} = mfdb_manager:st(Tab0),
+    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Key}),
             case erlfdb:get(Db, EncKey) of
                 not_found ->
                     [];
                 EVal ->
-                    [setelement(keypos(Tab), decode_val(Db, EVal), Key)]
-            end
-    end.
-
-lookup_bag(Db, TableId, Key, KeyPos) ->
-    EncKey = sext:encode({TableId, ?DATA_PREFIX(bag), Key}),
-    case erlfdb:get_range_startswith(Db, EncKey) of
-        not_found ->
-            [];
-        [] ->
-            [];
-        Rows ->
-            [begin
-                 K = mnesia_fdb_lib:decode_key(EKey, TableId),
-                 V = decode_val(Db, EVal),
-                 setelement(KeyPos, V, K)
-             end || {EKey, EVal} <- Rows]
-    end.
+                    DVal = mfdb_lib:decode_val(Db, TableId, EVal),
+                    Out = setelement(keypos(Tab0), DVal, Key),
+                    [Out]
+            end.
 
 match_delete(Alias, Tab0, Pat) when is_atom(Pat) ->
     ?dbg("~p : match_delete(~p, ~p, ~p)", [self(), Alias, Tab0, Pat]),
     %%do_match_delete(Alias, Tab, ?FDB_START),
     case is_wild(Pat) of
         true ->
-            #st{db = Db, table_id = TableId} = mnesia_fdb_manager:st(Tab0),
+            #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
             %% @TODO need to verify if the 'parts' of large values are also removed
-            Prefixes = [{TableId},
-                        {TableId, ?FDB_WC},
-                        {TableId, ?FDB_WC, ?FDB_WC},
-                        {TableId, ?FDB_WC, ?FDB_WC, ?FDB_WC}],
-            [ok = erlfdb:clear_range_startswith(Db, sext:prefix(Pfx)) || Pfx <- Prefixes],
+            Prefixes = [{?FDB_WC},
+                        {?FDB_WC, ?FDB_WC},
+                        {?FDB_WC, ?FDB_WC, ?FDB_WC}],
+            [ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, Pfx)) || Pfx <- Prefixes],
             ok;
         false ->
             %% can this happen??
@@ -545,17 +446,16 @@ match_delete(Alias, Tab0, Pat) when is_atom(Pat) ->
             error(badarg)
     end;
 match_delete(_Alias, Tab0, Pat) when is_tuple(Pat) ->
+    #st{db = Db, mtab = Tab0, table_id = TableId} = St = mfdb_manager:st(Tab0),
     KP = keypos(Tab0),
     Key = element(KP, Pat),
-    #st{db = Db, table_id = TableId} = St = mnesia_fdb_manager:st(Tab0),
     case is_wild(Key) of
         true ->
             %% @TODO need to verify if the 'parts' of large values are also removed
-            Prefixes = [{TableId},
-                        {TableId, ?FDB_WC},
-                        {TableId, ?FDB_WC, ?FDB_WC},
-                        {TableId, ?FDB_WC, ?FDB_WC, ?FDB_WC}],
-            [ok = erlfdb:clear_range_startswith(Db, sext:prefix(Pfx)) || Pfx <- Prefixes],
+            Prefixes = [{?FDB_WC},
+                        {?FDB_WC, ?FDB_WC},
+                        {?FDB_WC, ?FDB_WC, ?FDB_WC}],
+            [ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, Pfx)) || Pfx <- Prefixes],
             ok;
         false ->
             ok = do_match_delete(Pat, St)
@@ -564,68 +464,68 @@ match_delete(_Alias, Tab0, Pat) when is_tuple(Pat) ->
 
 first(Alias, Tab0) ->
     ?dbg("~p : first(~p, ~p)", [self(), Alias, Tab0]),
-    #st{db = Db, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab0),
-    StartKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
+    #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
+    StartKey = mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC}),
     EndKey = erlfdb_key:strinc(StartKey),
     case erlfdb:get_range(Db, StartKey, EndKey, [{limit,1}]) of
         [] ->
             '$end_of_table';
         [{EncKey, _}] ->
-            mnesia_fdb_lib:decode_key(EncKey, TableId)
+            mfdb_lib:decode_key(TableId, EncKey)
     end.
 
 next(Alias, Tab0, Key) ->
     ?dbg("~p : next(~p, ~p, ~p)", [self(), Alias, Tab0, Key]),
-    #st{db = Db, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab0),
-    SKey = sext:encode({TableId, ?DATA_PREFIX(Type), Key}),
-    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC})),
+    #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
+    SKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Key}),
+    EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC})),
     case erlfdb:get_range(Db, SKey, EKey, [{limit, 2}]) of
         [] ->
             '$end_of_table';
         [{K,_}] ->
-            case mnesia_fdb_lib:decode_key(K, TableId) of
+            case mfdb_lib:decode_key(TableId, K) of
                 Key ->
                     '$end_of_table';
                 OutKey ->
                     OutKey
             end;
         [{K0,_}, {K1, _}] ->
-            Key0 = mnesia_fdb_lib:decode_key(K0, TableId),
-            Key1 = mnesia_fdb_lib:decode_key(K1, TableId),
+            Key0 = mfdb_lib:decode_key(TableId, K0),
+            Key1 = mfdb_lib:decode_key(TableId, K1),
             hd(lists:delete(Key, [Key0, Key1]))
     end.
 
 prev(Alias, Tab0, Key) ->
     ?dbg("~p : prev(~p, ~p, ~p)", [self(), Alias, Tab0, Key]),
-    #st{db = Db, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab0),
-    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
-    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), Key})),
+    #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
+    SKey = mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC}),
+    EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, Key})),
     case erlfdb:get_range(Db, SKey, EKey, [{reverse, true}, {limit, 2}]) of
         [] ->
             '$end_of_table';
         [{K,_}] ->
-            case mnesia_fdb_lib:decode_key(K, TableId) of
+            case mfdb_lib:decode_key(TableId, K) of
                 Key ->
                     '$end_of_table';
                 OutKey ->
                     OutKey
             end;
         [{K0,_}, {K1, _}] ->
-            Key0 = mnesia_fdb_lib:decode_key(K0, TableId),
-            Key1 = mnesia_fdb_lib:decode_key(K1, TableId),
+            Key0 = mfdb_lib:decode_key(TableId, K0),
+            Key1 = mfdb_lib:decode_key(TableId, K1),
             hd(lists:delete(Key, [Key0, Key1]))
     end.
 
 last(Alias, Tab0) ->
     ?dbg("~p : last(~p, ~p)", [self(), Alias, Tab0]),
-    #st{db = Db, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab0),
-    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_WC}),
+    #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
+    SKey = mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC}),
     EKey = erlfdb_key:strinc(SKey),
     case erlfdb:get_range(Db, SKey, EKey, [{reverse, true}, {limit, 1}]) of
         [] ->
             '$end_of_table';
         [{K, _}] ->
-            mnesia_fdb_lib:decode_key(K, TableId)
+            mfdb_lib:decode_key(TableId, K)
     end.
 
 repair_continuation(Cont, _Ms) ->
@@ -652,10 +552,294 @@ select(Alias, Tab, Ms) ->
             '$end_of_table'
     end.
 
-select(Alias, Tab0, Ms, Limit) when is_integer(Limit) ->
-    ?dbg("~p : select(~p, ~p, ~p, ~p)", [self(),Alias, Tab0, Ms, Limit]),
-    #st{db = Db, table_id = TableId, tab = Tab, type = Type} = mnesia_fdb_manager:st(Tab0),
-    do_select(Db, TableId, Tab, Type, Ms, Limit).
+select(Alias, Tab0, Ms0, Limit) when is_integer(Limit) ->
+    ?dbg("~p : select(~p, ~p, ~p, ~p)", [self(),Alias, Tab0, Ms0, Limit]),
+    #st{db = Db, table_id = TableId, tab = Tab, mtab = MTab, index = Indexes0} = St = mfdb_manager:st(Tab0),
+    case Tab0 of
+        {_, index, _Idx} ->
+            ?dbg("Selecting from index: ~p~n", [_Idx]),
+            #st{db = Db, table_id = TableId, tab = Tab, mtab = MTab} = mfdb_manager:st(Tab0),
+            do_select(Db, TableId, Tab, MTab, Ms0, undefined, undefined, Limit);
+        _ ->
+            {Guards, Binds, Ms} =
+                case Ms0 of
+                    [{ {{_V, '$1'}} , G, _}] ->
+                        {G, [{1, ['$1']}], Ms0};
+                    [{HP, G, MsRet}] ->
+                        {NewHP, NewGuards} = ms_rewrite(HP, G),
+                        NewMs = [{NewHP, NewGuards, MsRet}],
+                        {NewGuards, bound_in_headpat(NewHP), NewMs};
+                    _ ->
+                        {[], [], Ms0}
+                end,
+            ?dbg("Guards: ~p Binds: ~p Ms: ~p~n", [Guards, Binds, Ms]),
+            ?dbg("FilterIndexes: ~p~n", [Indexes0]),
+            Indexes = [I || #idx{index_consistent = true} = I <- tuple_to_list(Indexes0)],
+            RangeGuards = range_guards(Guards, Binds, Indexes, []),
+            ?dbg("RangeGuards: ~p ~p~n", [RangeGuards, Indexes]),
+            {PkStart, PkEnd} = primary_table_range_(RangeGuards),
+            ?dbg("PkStart: ~p PkSend: ~p~n", [PkStart, PkEnd]),
+            case idx_sel(RangeGuards, Indexes, St) of
+                {use_index, IdxParams} = IdxSel ->
+                    ?dbg("IdxSel: ~p~n", [IdxSel]),
+                    ?dbg("mnesia_fdb:do_indexed_select(~p, ~p, ~p, ~p).~n",
+                         [Tab0, Ms, IdxParams, Limit]),
+                    do_indexed_select(Tab0, Ms, IdxParams, false, Limit);
+                no_index ->
+                    ?dbg("no_index: using MS ~p~n", [Ms]),
+                    do_select(Db, TableId, Tab, MTab, Ms, PkStart, PkEnd, Limit)
+            end
+    end.
+
+-spec range_guards(list({atom(), atom(), any()}), list(), list(), list()) -> list().
+range_guards([], _Binds, _Indexes, Acc) ->
+    lists:keysort(1, Acc);
+range_guards([{Comp, Bind, Val} | Rest], Binds, Indexes, Acc) ->
+    case lists:member(Comp, ['>', '>=', '<', '=<', '=:=']) of
+        true ->
+            %% Binds {rec_idx, [bind_id]} eg: [{2,['$1']}, {3,['$2']}, {4,['$3']}]
+            case lists:keyfind([Bind], 2, Binds) of
+                false ->
+                    ?dbg("Bind ~p not in binds ~p", [Bind, Binds]),
+                    range_guards(Rest, Binds, Indexes, Acc);
+                {Idx, _} ->
+                    ?dbg("Idx ~p in binds", [Idx]),
+                    case Idx =:= 2 orelse lists:keyfind(Idx, #idx.pos, Indexes) of
+                        true ->
+                            ?dbg("Column Idx ~p indexed: ~p", [Idx, Indexes]),
+                            %% Column indexed
+                            range_guards(Rest, Binds, Indexes, [{Idx, Comp, Val} | Acc]);
+                        false ->
+                            ?dbg("Column Idx ~p not indexed: ~p", [Idx, Indexes]),
+                            %% Column not indexed
+                            range_guards(Rest, Binds, Indexes, Acc);
+                        #idx{index_consistent = false} ->
+                            ?dbg("Index inconsistent: Not adding to guards: ~p", [{Idx, Comp, Val}]),
+                            range_guards(Rest, Binds, Indexes, Acc);
+                        #idx{index_consistent = true} ->
+                            ?dbg("Add to guards: ~p", [{Idx, Comp, Val}]),
+                            range_guards(Rest, Binds, Indexes, [{Idx, Comp, Val} | Acc])
+                    end
+            end;
+        false ->
+                    ?dbg("Unmatched comp ~p", [{Comp, Bind, Val}]),
+            range_guards(Rest, Binds, Indexes, Acc)
+    end.
+
+primary_table_range_(Guards) ->
+    primary_table_range_(Guards, undefined, undefined).
+
+primary_table_range_([], Start, End) ->
+    {replace_(Start, ?FDB_WC),
+     replace_(End, ?FDB_END)};
+primary_table_range_([{2, '>=', V} | Rest], undefined, End) ->
+    primary_table_range_(Rest, {gte, V}, End);
+primary_table_range_([{2, '>', V} | Rest], undefined, End) ->
+    primary_table_range_(Rest, {gt, V}, End);
+primary_table_range_([{2, '=<', V} | Rest], Start, undefined) ->
+    primary_table_range_(Rest, Start, {lte, V});
+primary_table_range_([{2, '<', V} | Rest], Start, undefined) ->
+    primary_table_range_(Rest, Start, {lt, V});
+primary_table_range_([_ | Rest], Start, End) ->
+    primary_table_range_(Rest, Start, End).
+
+idx_sel(Guards, Indexes, #st{mtab = Tab} = St0) ->
+    ?dbg("idx_sel Indexes: ~p~n", [Indexes]),
+    IdxSel0 = [begin
+                   #st{table_id = TableId} = mfdb_manager:st({Tab, index, {KeyPos, ordered}}),
+                   I = idx_table_params_(Guards, KeyPos, TableId),
+                   IdxValCount = case I of
+                       {_, _, {{'$1', '$2'}}, _} ->
+                           undefined;
+                       {_, _, {{M, '$2'}}, _} ->
+                           %% we have an exact match on in indexed value
+                           mfdb_lib:idx_matches(St0, KeyPos, M);
+                       _ ->
+                           undefined
+                   end,
+                   ?dbg("IdxParams [~p]: idx_table_params_(~p, ~p) -> ~p~n", [KeyPos, Guards, KeyPos, I]),
+                   {KeyPos, I, IdxValCount}
+               end || #idx{pos = KeyPos, index_consistent = true} <- Indexes],
+    ?dbg("IdxSel0: ~p~n", [IdxSel0]),
+    case IdxSel0 of
+        [] ->
+            no_index;
+        IdxSel0 ->
+            AvailIdx = [{idx_val_(I), Kp, I, IdxVCount} || {Kp, I, IdxVCount} <- IdxSel0, I =/= undefined],
+            case idx_pick(AvailIdx) of
+                undefined ->
+                    no_index;
+                {_, IdxId, IdxSel, _} ->
+                    ?dbg("IdxSel: ~p~n", [IdxSel]),
+                    {use_index, {IdxId, IdxSel}}
+            end
+    end.
+
+idx_pick(Idx) ->
+    idx_pick(Idx, undefined).
+
+idx_pick([], Res) ->
+    Res;
+idx_pick([First | Rest], undefined) ->
+    idx_pick(Rest, First);
+idx_pick([{_IdxVal0, _, _, ValCount0} = Idx | Rest], {_IdxVal1, _, _, ValCount1})
+    when is_integer(ValCount0) andalso
+         is_integer(ValCount1) andalso
+         ValCount0 < ValCount1 ->
+    %% less keys to scan through
+    idx_pick(Rest, Idx);
+idx_pick([{_IdxVal0, _, _, ValCount0} | Rest], {_IdxVal1, _, _, ValCount1} = Idx)
+    when is_integer(ValCount0) andalso
+         is_integer(ValCount1) andalso
+         ValCount1 < ValCount0 ->
+    idx_pick(Rest, Idx);
+idx_pick([{IdxVal0, _, _, ValCount0} | Rest], {IdxVal1, _, _, ValCount1} = Idx)
+    when is_integer(ValCount0) andalso
+         is_integer(ValCount1) andalso
+         ValCount0 =:= ValCount1 andalso
+         IdxVal1 >= IdxVal0 ->
+    idx_pick(Rest, Idx);
+idx_pick([{IdxVal0, _, _, ValCount0} = Idx | Rest], {IdxVal1, _, _, ValCount1})
+    when is_integer(ValCount0) andalso
+         is_integer(ValCount1) andalso
+         ValCount0 =:= ValCount1 andalso
+         IdxVal0 >= IdxVal1 ->
+    idx_pick(Rest, Idx);
+idx_pick([{_IdxVal0, _, _, ValCount0} = Idx | Rest], {_IdxVal1, _, _, undefined})
+    when is_integer(ValCount0) ->
+    %% explicit index vs scan
+    idx_pick(Rest, Idx);
+idx_pick([{_IdxVal0, _, _, undefined} | Rest], {_IdxVal1, _, _, ValCount1} = Idx)
+    when is_integer(ValCount1) ->
+    %% explicit index vs scan
+    idx_pick(Rest, Idx);
+idx_pick([{IdxVal0, _, _, undefined} = Idx | Rest], {IdxVal1, _, _, undefined})
+    when IdxVal0 >= IdxVal1 ->
+    %% explicit index vs scan
+    idx_pick(Rest, Idx);
+idx_pick([{IdxVal0, _, _, undefined} | Rest], {IdxVal1, _, _, undefined} = Idx)
+    when IdxVal1 >= IdxVal0 ->
+    idx_pick(Rest, Idx).
+
+%% @doc convert guards into index-table specific selectors
+%% Guards are the guards extracted from the MatchSpec.
+%% This is very basic/naive implementation
+%% @todo :: deal with multi-conditional guards with 'andalso', 'orelse' etc
+%% @end
+idx_table_params_(Guards, Keypos, TableId) ->
+    ?dbg("idx_table_params_(~p, ~p, ~p)", [Guards, Keypos, TableId]),
+    case lists:keyfind(Keypos, 1, Guards) of
+        false ->
+            undefined;
+        _ ->
+            idx_table_params_(Guards, Keypos, TableId, undefined, undefined, {{'$1', '$2'}}, [])
+    end.
+
+idx_table_params_([], _Keypos, TableId, Start, End, Match, Guards) ->
+    ?dbg("Start: ~p~nEnd:~p~nMatch:~p~nGuards:~p~n",[Start, End, Match, Guards]),
+    PfxStart = index_pfx(start, ?FDB_WC, true),
+    PfxEnd = index_pfx('end', ?FDB_END, true),
+    {replace_(Start, {fdb, mfdb_lib:encode_prefix(TableId, PfxStart)}),
+     replace_(End, {fdb, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, PfxEnd))}),
+     Match,
+     Guards};
+idx_table_params_([{Keypos, '=:=', Val} | Rest], Keypos, TableId, _Start, _End, _Match, Guards) ->
+    Match = {{Val, '$2'}},
+    PfxStart = index_pfx(start, Val, true),
+    PfxEnd = index_pfx('end', Val, true),
+    ?dbg("Setting Start [~p]: mfdb_lib:encode_prefix(~p, ~p)~n",
+         [Keypos, TableId, PfxStart]),
+    Start = {fdbr, mfdb_lib:encode_prefix(TableId, PfxStart)},
+    ?dbg("Setting End [~p]: erlfdb_key:strinc(mfdb_lib:encode_key(~p, ~p))~n",
+         [Keypos, TableId, PfxEnd]),
+    End = {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, PfxEnd))},
+    idx_table_params_(Rest, Keypos, TableId, Start, End, Match, Guards);
+idx_table_params_([{Keypos, Comp, Val} | Rest], Keypos, TableId, Start, End, Match, Guards)
+  when Comp =:= '>=' orelse Comp =:= '>' ->
+    NGuards = [{Comp, '$1', Val} | Guards],
+    PfxStart = index_pfx(start, Val, true),
+    ?dbg("Setting Start [~p]: mfdb_lib:encode_prefix(~p, ~p)~n",
+         [Keypos, TableId, PfxStart]),
+    NStart0 = {fdbr, mfdb_lib:encode_prefix(TableId, PfxStart)},
+    NStart = replace_(Start, NStart0),
+    idx_table_params_(Rest, Keypos, TableId, NStart, End, Match, NGuards);
+idx_table_params_([{Keypos, Comp, Val} | Rest], Keypos, TableId, Start, End, Match, Guards)
+  when Comp =:= '=<' orelse Comp =:= '<' ->
+    NGuards = [{Comp, '$1', Val} | Guards],
+    PfxEnd = index_pfx('end', Val, true),
+    ?dbg("Setting End [~p]: erlfdb_key:strinc(mfdb_lib:encode_prefix(~p, ~p))~n",
+         [Keypos, TableId, PfxEnd]),
+    NEnd0 = {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, PfxEnd))},
+    NEnd = replace_(End, NEnd0),
+    idx_table_params_(Rest, Keypos, TableId, Start, NEnd, Match, NGuards);
+idx_table_params_([_ | Rest], Keypos, TableId, Start, End, Match, Guards) ->
+    idx_table_params_(Rest, Keypos, TableId, Start, End, Match, Guards).
+
+replace_(undefined, Val) ->
+    Val;
+replace_(Orig, _Val) ->
+    Orig.
+
+v_(undefined) -> 0;
+v_({fdb, B}) when is_binary(B) -> 1; %% pre-calculated range
+v_({fdbr, B}) when is_binary(B) -> 2; %% pre-calculated range
+v_({{_, '$1'}}) -> 10;
+v_({{'$1', '$2'}}) -> 0; %% indicates guards will be processed
+v_({{_, '$2'}}) -> 20; %% indicates a head-bound match
+v_({_, _}) -> 1;
+v_(?FDB_WC) -> 0; %% scan from start of table
+v_(?FDB_END) -> 0; %% scan to end of table
+v_(B) when is_binary(B) -> 1;
+v_(L) when is_list(L) ->
+    %% number of guards
+    length(L) * 0.5.
+
+idx_val_(undefined) ->
+    0;
+idx_val_({S,E,C,G}) ->
+    lists:sum([v_(X) || X <- [S,E,C,G]]).
+
+%%92> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when E =< 100 -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'=<','$3',100}],
+%%  ['$1']}]
+%%93> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when E =< 100; E > 0 -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'=<','$3',100}],
+%%  ['$1']},
+%% {#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'>','$3',0}],
+%%  ['$1']}]
+%%94> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when E =< 100 andalso E > 0 -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'andalso',{'=<','$3',100},{'>','$3',0}}],
+%%  ['$1']}]
+%%95> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when E =< 100, E > 0 -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'=<','$3',100},{'>','$3',0}],
+%%  ['$1']}]
+%%96> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when E =< 100 orelse E > 0 -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'orelse',{'=<','$3',100},{'>','$3',0}}],
+%%  ['$1']}]
+%%97> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when (E =< 100 orelse E > 0); (E =< 100 andalso E > 0) -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'orelse',{'=<','$3',100},{'>','$3',0}}],
+%%  ['$1']},
+%% {#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'andalso',{'=<','$3',100},{'>','$3',0}}],
+%%  ['$1']}]
+%%98> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when (E =< 100 orelse E > 0) andalso (E =< 100 andalso E > 0) -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'andalso',{'orelse',{'=<','$3',100},{'>','$3',0}},
+%%              {'andalso',{'=<','$3',100},{'>','$3',0}}}],
+%%  ['$1']}]
+%%99> ets:fun2ms(fun(#test{id = I, expires = E, value = V}) when (E =< 100 orelse E > 0) orelse (E =< 100 andalso E > 0) -> I end).
+%%[{#test{id = '$1',value = '$2',expires = '$3'},
+%%  [{'orelse',{'orelse',{'=<','$3',100},{'>','$3',0}},
+%%             {'andalso',{'=<','$3',100},{'>','$3',0}}}],
+%%  ['$1']}]
+
 
 slot(_A, _B, _C) ->
     ?dbg("~p : slot(~p, ~p, ~p)", [self(),_A, _B, _C]),
@@ -663,73 +847,65 @@ slot(_A, _B, _C) ->
 
 update_counter(Alias, Tab, Key, Incr) when is_integer(Incr) ->
     ?dbg("~p : update_counter(~p, ~p, ~p)", [self(),Alias, Tab, Key, Incr]),
-    #st{} = St = mnesia_fdb_manager:st(Tab),
+    #st{} = St = mfdb_manager:st(Tab),
     do_update_counter(Key, Incr, St).
 
 %% server-side part
-do_update_counter(_Key, _Incr, #st{type = bag}) ->
-    mnesia:abort(badarg);
 do_update_counter(Key, Incr, #st{db = Db, table_id = TableId}) when is_integer(Incr) ->
-    %% Atomic counter increment
-    %% Mnesia counters are dirty only, and cannot go below zero
-    %%  dirty_update_counter({Tab, Key}, Incr) -> NewVal | exit({aborted, Reason})
-    %%    Calls mnesia:dirty_update_counter(Tab, Key, Incr).
-    %%
-    %%  dirty_update_counter(Tab, Key, Incr) -> NewVal | exit({aborted, Reason})
-    %%    Mnesia has no special counter records. However, records of
-    %%    the form {Tab, Key, Integer} can be used as (possibly disc-resident)
-    %%    counters when Tab is a set. This function updates a counter with a positive
-    %%    or negative number. However, counters can never become less than zero.
-    %%    There are two significant differences between this function and the action
-    %%    of first reading the record, performing the arithmetics, and then writing the record:
-    %%
-    %%    It is much more efficient. mnesia:dirty_update_counter/3 is performed as an
-    %%    atomic operation although it is not protected by a transaction.
-    %%    If two processes perform mnesia:dirty_update_counter/3 simultaneously, both
-    %%    updates take effect without the risk of losing one of the updates. The new
-    %%    value NewVal of the counter is returned.
-    %%
-    %%    If Key do not exists, a new record is created with value Incr if it is larger
-    %%    than 0, otherwise it is set to 0.
-    %%
-    %% This implementation tries to follow the same pattern.
-    %% Increment the counter and then read the new value
-    %%  - if the new value is < 0 (not allowed), abort
-    %%  - if the new value is > 0, return the new value
-    %% The exception:
-    %%   if the counter does not exist and is created with a Incr < 0
-    %%    we abort instead of creating a counter with value of '0'
-    EncKey = sext:encode({TableId, <<"c">>, Key}),
+    EncKey = mfdb_lib:encode_key(TableId, {<<"c">>, Key}),
     Tx = erlfdb:create_transaction(Db),
-    ok = erlfdb:wait(erlfdb:add(Tx, EncKey, Incr)),
-    case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
-        not_found ->
-            ok = erlfdb:wait(erlfdb:reset(Tx)),
-            %% Really should never hit this case
-            mnesia:abort(missing_counter);
-        <<NewVal:64/unsigned-little-integer>> when NewVal < 0 ->
-            %% Value for mnesia counter cannot be < 0
-            ok = erlfdb:wait(erlfdb:reset(Tx)),
-            mnesia:abort(counter_less_than_zero);
-        <<NewVal:64/unsigned-little-integer>> ->
-            ok = erlfdb:wait(erlfdb:commit(Tx)),
-            %% Counter incremented, return new value
-            %% This could very well not be what was expected
-            %% since the counter may have been incremented
-            %% by other transactions
-            NewVal
-    end.
+    {ok, NewVal} = mfdb_lib:update_counter(Tx, EncKey, Incr),
+    erlfdb:wait(erlfdb:commit(Tx)),
+    NewVal.
 
 %% PRIVATE
 
 %% record and key validation
 validate_key(_Alias, _Tab, RecName, Arity, Type, _Key) ->
-    ?dbg("~p : validate_key(~p, ~p, ~p, ~p, ~p, ~p)", [self(),_Alias, _Tab, RecName, Arity, Type, _Key]),
+    %%?dbg("~p : validate_key(~p, ~p, ~p, ~p, ~p, ~p)", [self(),_Alias, _Tab, RecName, Arity, Type, _Key]),
     {RecName, Arity, Type}.
 
-validate_record(_Alias, _Tab, RecName, Arity, Type, _Obj) ->
-    ?dbg("~p : validate_record(~p, ~p, ~p, ~p, ~p, ~p)", [self(),_Alias, _Tab, RecName, Arity, Type, _Obj]),
-    {RecName, Arity, Type}.
+%% Ensure any values are not too large for any indexed columns
+validate_record(_Alias, Tab0, RecName, Arity, Type, Obj) ->
+    #st{mtab = Tab0, index = Indexes} = St = mfdb_manager:st(Tab0),
+    InTrans = mnesia:is_transaction(),
+    case value_size_guard_(tuple_to_list(Indexes), St, Obj) of
+        ok ->
+            {RecName, Arity, Type};
+        {error, IdxCol} when InTrans =:= true ->
+            mnesia:abort({value_too_large_for_field, IdxCol});
+        %%{value_too_large_for_field, IdxCol};
+        {error, IdxCol} when InTrans =:= false ->
+            {error, {value_too_large_for_field, IdxCol}}
+    end.
+
+value_size_guard_([], _St, _Obj) ->
+    ok;
+value_size_guard_([undefined | Rest], #st{} = St, Obj) ->
+    value_size_guard_(Rest, St, Obj);
+value_size_guard_([#idx{pos = P} | Rest], #st{table_id = TableId, attributes = Attrib} = St, {{_V,_Id}} = Idx) ->
+    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Idx}),
+    ByteSize = byte_size(EncKey),
+    case ByteSize of
+        X when X > ?MAX_KEY_SIZE ->
+            IdxCol = lists:nth(P - 1, Attrib),
+            {error, IdxCol};
+        _ ->
+            value_size_guard_(Rest, St, Idx)
+    end;
+value_size_guard_([#idx{pos = P} | Rest], #st{table_id = TableId, attributes = Attrib} = St, Obj) ->
+    IdxVal = element(P, Obj),
+    IdxId = element(2, Obj),
+    Idx = {{IdxVal, IdxId}},
+    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Idx}),
+    ByteSize = byte_size(EncKey),
+    case ByteSize of
+        X when X > 50 ->
+            IdxCol = lists:nth(P - 1, Attrib),
+            {error, IdxCol};
+        _ ->
+            value_size_guard_(Rest, St, Obj)
+    end.
 
 %% file extension callbacks
 
@@ -754,13 +930,14 @@ do_insert(K, V, #st{} = St) ->
 do_delete(Key, #st{} = St) ->
     return_catch(fun() -> db_delete(St, Key) end).
 
-do_match_delete(Pat, #st{table_id = TableId, tab = Tab, type = Type} = St) ->
+do_match_delete(Pat, #st{table_id = TableId, mtab = MTab} = St) ->
     MS = [{Pat,[],['$_']}],
-    Keypat = keypat(MS, keypos(Tab)),
+    IsIndex = is_index(MTab),
+    Keypat = keypat(MS, TableId, IsIndex, keypos(MTab)),
     CompiledMS = ets:match_spec_compile(MS),
-    DPfx = ?DATA_PREFIX(Type),
-    StartKey = sext:prefix({TableId, DPfx, Keypat}),
-    EndKey = erlfdb_key:strinc(sext:prefix({TableId, DPfx, ?FDB_END})),
+    DPfx = ?DATA_PREFIX,
+    StartKey = mfdb_lib:encode_prefix(TableId, {DPfx, Keypat}),
+    EndKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {DPfx, ?FDB_END})),
     do_fold_delete_(St, StartKey, EndKey, DPfx, Keypat, CompiledMS).
 
 do_fold_delete_(#st{db = Db, table_id = TableId} = St,
@@ -780,7 +957,7 @@ do_fold_delete_(#st{db = Db, table_id = TableId} = St,
                     '$end_of_table';
                 LastKey ->
                     ok = erlfdb:wait(erlfdb:commit(Tx)),
-                    NStartKey = sext:prefix({TableId, DPfx, LastKey}),
+                    NStartKey = mfdb_lib:encode_prefix(TableId, {DPfx, LastKey}),
                     case NStartKey =:= StartKey of
                         true ->
                             '$end_of_table';
@@ -792,17 +969,19 @@ do_fold_delete_(#st{db = Db, table_id = TableId} = St,
 
 do_fold_delete2_(_St, [], _Tx, _Keypat, _CompiledMS, LastKey) ->
     LastKey;
-do_fold_delete2_(#st{table_id = TableId, tab = Tab} = St, [{EncKey, EncV} | Rest], Tx, Keypat, MS, _LK) ->
-    K = mnesia_fdb_lib:decode_key(EncKey, TableId),
+do_fold_delete2_(#st{table_id = TableId, mtab = MTab} = St, [{EncKey, EncV} | Rest], Tx, Keypat, MS, _LK) ->
+    K = mfdb_lib:decode_key(TableId, EncKey),
     case is_prefix(Keypat, K) of
         true ->
-            Rec = setelement(keypos(Tab), decode_val(Tx, EncV), decode_key(K)),
+            Rec = setelement(keypos(MTab),
+                             mfdb_lib:decode_val(Tx, TableId, EncV),
+                             mfdb_lib:decode_key(TableId, K)),
             case ets:match_spec_run([Rec], MS) of
                 [] ->
                     do_fold_delete_(St, Rest, Tx, Keypat, MS, K);
                 [_Match] ->
                     %% Keep the delete op within the same transaction
-                    ok = mnesia_fdb_lib:delete(St#st{db = Tx}, K),
+                    ok = mfdb_lib:delete(St#st{db = Tx}, K),
                     do_fold_delete2_(St, Rest, Tx, Keypat, MS, K)
             end;
         false ->
@@ -812,43 +991,130 @@ do_fold_delete2_(#st{table_id = TableId, tab = Tab} = St, [{EncKey, EncV} | Rest
 %% ----------------------------------------------------------------------------
 %% PRIVATE SELECT MACHINERY
 %% ----------------------------------------------------------------------------
+%% 2-step select using the picked index for the inner select from an index table
+%% and wrapping in an outer select function to allow matching other guards
+%% @todo: use multiple indexes, possibly with a parallel query to get all ids, and use intersection for final id list
+do_indexed_select(Tab0, MS, {IdxPos, {Start, End, Match, Guard}}, AccKeys, Limit) when is_boolean(AccKeys) ->
+    #st{db = Db, table_id = OTableId, mtab = OMTab, index = Indexes} = mfdb_manager:st(Tab0),
+    #idx{table_id = ITableId, tab = ITab, mtab = IMTab} = element(IdxPos, Indexes),
+    KeyMs = [{Match, Guard, ['$_']}],
+    OKeysOnly = needs_key_only(MS),
+    InTransaction = mnesia:is_transaction(),
+    ICompiledKeyMs = ets:match_spec_compile(KeyMs),
+    OCompiledKeyMs = ets:match_spec_compile(MS),
+    OuterMatchFun = outer_match_fun_(OTableId, OMTab, OCompiledKeyMs, AccKeys),
+    ?dbg("KeyMs: ~p~n", [KeyMs]),
+    DataFun = index_match_fun_(ICompiledKeyMs, OuterMatchFun),
+    OAcc = [],
+    IRange = {range, Start, End},
+    Iter = iter_(Db, ITableId, ITab, IMTab, IRange, AccKeys, OKeysOnly, undefined, DataFun, OAcc, Limit),
+    do_iter(InTransaction, Iter, Limit, []).
 
-do_select(Db, TableId, Tab, Type, MS, Limit) ->
-    do_select(Db, TableId, Tab, Type, MS, false, Limit).
-
-do_select(Db, TableId, Tab, Type, MS, AccKeys, Limit) when is_boolean(AccKeys) ->
-    Keypat0 = keypat(MS, 2),
-    %%KeysOnly = needs_key_only(MS),
-    {ReturnKeysOnly, NeedKeysOnly} = select_return_keysonly_(MS),
-    InTransaction = is_in_transaction(),
-    case {ReturnKeysOnly, NeedKeysOnly} of
-        {true, true} ->
-            ?dbg("Keys only query", []),
-            CompiledMs = undefined,
-            DataFun = undefined,
-            InAcc = [],
-            Iter = iter_(Db, TableId, Tab, Type, ?FDB_WC, ReturnKeysOnly, NeedKeysOnly, CompiledMs, DataFun, InAcc, Limit),
-            %% io:format("Keys only: ~p~n", [needs_key_only(MS)]),
-            do_iter(InTransaction, Iter, Limit, []);
-        _ ->
-            ?dbg("Need Keys for query", []),
-            Keypat = case Keypat0 of
-                         <<>> -> ?FDB_WC;
-                         Keypat0 -> Keypat0
-                     end,
-            CompiledMs = ets:match_spec_compile(MS),
-            DataFun = undefined,
-            InAcc = [],
-            Iter = iter_(Db, TableId, Tab, Type, Keypat, ReturnKeysOnly, NeedKeysOnly, CompiledMs, DataFun, InAcc, Limit),
-            do_iter(InTransaction, Iter, Limit, [])
+outer_match_fun_(OTableId, OMTab, OCompiledKeyMs, AccKeys) ->
+    fun(Tx, Id, Acc0) ->
+                    ?dbg("Outer match fun", []),
+                    K = mfdb_lib:encode_key(OTableId, {?DATA_PREFIX, Id}),
+                    case erlfdb:wait(erlfdb:get(Tx, K)) of
+                        not_found ->
+                            %% This should only happen with a dead index
+                            %% entry (data deleted after we got index)
+                            Acc0;
+                        V ->
+                            Value = mfdb_lib:decode_val(Tx, OTableId, V),
+                            Rec = setelement(keypos(OMTab), Value, Id),
+                            case OCompiledKeyMs =/= undefined andalso
+                                ets:match_spec_run([Rec], OCompiledKeyMs) of
+                                [] ->
+                                    %% Did not match specification
+                                    Acc0;
+                                [Matched] when AccKeys =:= true ->
+                                    %% Matched specification
+                                    [{Id, Matched} | Acc0];
+                                [Matched] when AccKeys =:= false ->
+                                    %% Matched specification
+                                    [Matched | Acc0];
+                                false when AccKeys =:= true ->
+                                    %% No match specification
+                                    [{Id, Rec} | Acc0];
+                                false when AccKeys =:= false ->
+                                    %% No match specification
+                                    [Rec | Acc0]
+                            end
+                    end
     end.
 
+index_match_fun_(ICompiledKeyMs, OuterMatchFun) ->
+    fun(Tx, {{_, Id}} = R, IAcc) ->
+            ?dbg("index match : ~p", [R]),
+            case ICompiledKeyMs =/= undefined andalso
+                ets:match_spec_run([R], ICompiledKeyMs) of
+                [] ->
+                    ?dbg("index_match_fun_ ~p not matched", [R]),
+                    %% Did not match
+                    IAcc;
+                [{{_, Id}}] ->
+                    ?dbg("index_match_fun_ ~p matched", [R]),
+                    %% Matched
+                    OuterMatchFun(Tx, Id, IAcc);
+                false ->
+                    ?dbg("index_match_fun_ ~p no match spec", [R]),
+                    %% No match specification
+                    OuterMatchFun(Tx, Id, IAcc)
+            end
+    end.
+
+is_index(MTab) when is_atom(MTab) ->
+    false;
+is_index(_MTab) ->
+    true.
+
+do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, Limit) ->
+    do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, false, Limit).
+
+do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, AccKeys, Limit) when is_boolean(AccKeys) ->
+    IsIndex = is_index(MTab),
+    Keypat0 = keypat(MS, TableId, IsIndex, 2),
+    KeysOnly = needs_key_only(MS),
+    InTransaction = mnesia:is_transaction(),
+    Keypat = case Keypat0 of
+                 <<>> when IsIndex =:= true ->
+                     mfdb_lib:encode_prefix(TableId, {<<"di">>, ?FDB_WC});
+                 _ when IsIndex =:= false andalso (PkStart =/= undefined orelse PkEnd =/= undefined) ->
+                     {range,
+                         pk_to_range(TableId, start, PkStart),
+                         pk_to_range(TableId, 'end', PkEnd)
+                     };
+                 <<>> when IsIndex =:= false ->
+                     mfdb_lib:encode_prefix(TableId, {<<"d">>, ?FDB_WC});
+                 Keypat0 -> Keypat0
+             end,
+    CompiledMs = ets:match_spec_compile(MS),
+    DataFun = undefined,
+    InAcc = [],
+    ?dbg("KeyPat: ~p~n", [Keypat]),
+    Iter = iter_(Db, TableId, Tab, MTab, Keypat, AccKeys, KeysOnly, CompiledMs, DataFun, InAcc, Limit),
+    do_iter(InTransaction, Iter, Limit, []).
+
+%% ordered set tables
+pk_to_range(TableId, start, {gt, X}) ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X}))};
+pk_to_range(TableId, start, {gte, X}) ->
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X})};
+pk_to_range(TableId, 'end', {lt, X}) ->
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X})};
+pk_to_range(TableId, 'end', {lte, X}) ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X}))};
+pk_to_range(TableId, start, _) ->
+    {fdbr, mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC})};
+pk_to_range(TableId, 'end', _) ->
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_END}))}.
+
 do_iter(_InTransaction, '$end_of_table', Limit, Acc) when Limit =:= 0 ->
-    {Acc, '$end_of_table'};
+    {?SORT(Acc), '$end_of_table'};
 do_iter(_InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit =:= 0 ->
-    {lists:append(Acc, Data), '$end_of_table'};
+    {?SORT(lists:append(Acc, Data)), '$end_of_table'};
 do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit =:= 0 andalso is_function(Iter) ->
-    NAcc = lists:append(Acc, Data),
+    NAcc = ?SORT(lists:append(Acc, Data)),
     case Iter() of
         '$end_of_table' ->
             NAcc;
@@ -860,44 +1126,40 @@ do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit =:= 0 andalso is_fu
 do_iter(InTransaction, '$end_of_table', Limit, Acc) when Limit > 0 ->
     case InTransaction of
         true ->
-            {Acc, '$end_of_table'};
+            {?SORT(Acc), '$end_of_table'};
         false ->
             Acc
     end;
 do_iter(InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit > 0 ->
     case InTransaction of
         true ->
-            {lists:append(Acc, Data), '$end_of_table'};
+            {?SORT(lists:append(Acc, Data)), '$end_of_table'};
         false ->
             lists:append(Acc, Data)
     end;
 do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit > 0 andalso is_function(Iter) ->
-    NAcc = lists:append(Acc, Data),
+    NAcc = ?SORT(lists:append(Acc, Data)),
     {NAcc, Iter}.
 
-is_in_transaction() ->
-    case get(mnesia_activity_state) of
-        {mnesia,MTid,_} when element(1, MTid) =:= tid ->
-            true;
-        _ ->
-            false
-    end.
-
-select_return_keysonly_([{HP,Guards,Body}]) ->
+needs_key_only([{HP,_,Body}]) ->
     BodyVars = lists:flatmap(fun extract_vars/1, Body),
     %% Note that we express the conditions for "needs more than key" and negate.
-    WildInBody = wild_in_body(BodyVars),
-    BoundInHeadPatt = bound_in_headpat(HP),
-    %%io:format("BodyVars: ~p~n", [BodyVars]),
-    %%io:format("WildInBody: ~p~n", [WildInBody]),
-    %%io:format("BoundInHeadPatt: ~p~n", [BoundInHeadPatt]),
-    {2, [IdBind]} = hd(BoundInHeadPatt),
-    ReturnKeysOnly = not WildInBody andalso (IdBind =/= ['_'] andalso BodyVars =:= [IdBind]),
-    NeedKeysOnly = ReturnKeysOnly andalso Guards =:= [],
-    %% io:format("ReturnKeysOnly: ~p NeedKeysOnly: ~p~n", [ReturnKeysOnly, NeedKeysOnly]),
-    {ReturnKeysOnly, NeedKeysOnly};
-select_return_keysonly_(_) ->
-    {false, false}.
+    InHead = bound_in_headpat(HP),
+    ?dbg("BoundInHead: ~p", [InHead]),
+    not(wild_in_body(BodyVars) orelse
+        case InHead of
+            {all,V} -> lists:member(V, BodyVars);
+            none    -> false;
+            Vars    -> any_in_body(lists:keydelete(2,1,Vars), BodyVars)
+        end);
+needs_key_only(_) ->
+    %% don't know
+    false.
+
+any_in_body(Vars, BodyVars) ->
+    lists:any(fun({_,Vs}) ->
+                      intersection(Vs, BodyVars) =/= []
+              end, Vars).
 
 extract_vars([H|T]) ->
     extract_vars(H) ++ extract_vars(T);
@@ -930,6 +1192,44 @@ bound_in_headpat(_) ->
     %% this is not the place to throw an exception
     none.
 
+ms_rewrite(HP, Guards) when is_atom(HP) ->
+    {HP, Guards};
+ms_rewrite(HP, Guards) when is_tuple(HP) ->
+    [_|T] = tuple_to_list(HP),
+    {_, Used, Matches} =
+        lists:foldl(
+                     fun('_', {Inc, U, Acc}) ->
+                             {Inc + 1, U, Acc};
+                        (M, {Inc, U, Acc}) when is_atom(M) ->
+                            case atom_to_binary(M, utf8) of
+                                <<"$", _/binary>> ->
+                                    {Inc + 1, [M | U], Acc};
+                                _ ->
+                                    {Inc + 1, U, [{Inc, M} | Acc]}
+                            end;
+                        (Match, {Inc, U, Acc}) ->
+                             {Inc + 1, U, [{Inc, Match} | Acc]}
+                     end,
+                     {2, [], []}, T),
+    headpat_matches_to_guards(HP, Guards, Used, Matches).
+
+headpat_matches_to_guards(HP, Guards, _Used, []) ->
+    {HP, Guards};
+headpat_matches_to_guards(HP, Guards, Used0, [{Idx, Val} | Rest]) ->
+    {Used, Bind} = next_bind(Used0, Idx),
+    NewHP = setelement(Idx, HP, Bind),
+    NewGuards = [{'=:=', Bind, Val} | Guards],
+    headpat_matches_to_guards(NewHP, NewGuards, Used, Rest).
+
+next_bind(Used, X) ->
+    Bind = list_to_atom("$" ++ integer_to_list(X)),
+    case lists:member(Bind, Used) of
+        true ->
+            next_bind(Used, X+1);
+        false ->
+            {[Bind | Used], Bind}
+    end.
+
 map_vars([H|T], P) ->
     case extract_vars(H) of
         [] ->
@@ -949,14 +1249,14 @@ is_prefix(A, B) when is_binary(A), is_binary(B) ->
             false
     end.
 
-keypat([H|T], KeyPos) ->
-    keypat(T, KeyPos, keypat_pfx(H, KeyPos)).
+keypat([H|T], TableId, IsIndex, KeyPos) ->
+    keypat(T, TableId, IsIndex, KeyPos, keypat_pfx(H, TableId, IsIndex, KeyPos)).
 
-keypat(_, _, <<>>) -> <<>>;
-keypat([H|T], KeyPos, Pfx0) ->
-    Pfx = keypat_pfx(H, KeyPos),
-    keypat(T, KeyPos, common_prefix(Pfx, Pfx0));
-keypat([], _, Pfx) ->
+keypat(_, _TableId, _IsIndex, _, <<>>) -> <<>>;
+keypat([H|T], TableId, IsIndex, KeyPos, Pfx0) ->
+    Pfx = keypat_pfx(H, TableId, IsIndex, KeyPos),
+    keypat(T, TableId, IsIndex, KeyPos, common_prefix(Pfx, Pfx0));
+keypat([], _TableId, _IsIndex, _, Pfx) ->
     Pfx.
 
 common_prefix(<<H, T/binary>>, <<H, T1/binary>>) ->
@@ -964,11 +1264,30 @@ common_prefix(<<H, T/binary>>, <<H, T1/binary>>) ->
 common_prefix(_, _) ->
     <<>>.
 
-keypat_pfx({HeadPat,_Gs,_}, KeyPos) when is_tuple(HeadPat) ->
+keypat_pfx({{HeadPat},_Gs,_}, TableId, IsIndex, KeyPos) when is_tuple(HeadPat) ->
+    ?dbg("element(~p, ~p)", [KeyPos, HeadPat]),
     KP      = element(KeyPos, HeadPat),
-    sext:prefix(KP);
-keypat_pfx(_, _) ->
+    KeyPat = index_pfx('start', KP, IsIndex),
+    mfdb_lib:encode_prefix(TableId, KeyPat);
+keypat_pfx({HeadPat,_Gs,_}, TableId, IsIndex, KeyPos) when is_tuple(HeadPat) ->
+    ?dbg("element(~p, ~p)", [KeyPos, HeadPat]),
+    KP      = element(KeyPos, HeadPat),
+    KeyPat = index_pfx('start', KP, IsIndex),
+    mfdb_lib:encode_prefix(TableId, KeyPat);
+keypat_pfx(_, _, _, _) ->
     <<>>.
+
+index_pfx(start, V, true) ->
+    Pfx = {<<(?DATA_PREFIX)/binary, "i">>, {V, ?FDB_WC}},
+    ?dbg("prefix: ~p", [Pfx]),
+    Pfx;
+index_pfx('end', V, true) ->
+    Pfx = {<<(?DATA_PREFIX)/binary, "i">>, {V, ?FDB_END}},
+    ?dbg("prefix: ~p", [Pfx]),
+    Pfx;
+index_pfx(_D, V, false) ->
+    %%io:format("Type: ~p D: ~p V: ~p~n", [Type, D, V]),
+    V.
 
 
 %% ----------------------------------------------------------------------------
@@ -984,46 +1303,46 @@ return_catch(F) when is_function(F, 0) ->
     end.
 
 db_delete(#st{db = Db} = St, K) ->
-    Res = mnesia_fdb_lib:delete(St, K),
+    Res = mfdb_lib:delete(St, K),
     write_result(Res, delete, [Db, K], St).
 
 db_put(#st{db = Db} = St, K, V) ->
-    Res = mnesia_fdb_lib:put(St, K, V),
+    Res = mfdb_lib:put(St, K, V),
     write_result(Res, put, [Db, K, V], St).
 
 write_result(ok, _, _, _) ->
     ok;
-write_result(Res, Op, Args, #st{tab = Tab, on_write_error = Rpt, on_write_error_store = OWEStore}) ->
+write_result(Res, Op, Args, #st{tab = Tab, table_id = TableId, on_write_error = Rpt, on_write_error_store = OWEStore}) ->
     RptOp = rpt_op(Rpt),
-    maybe_store_error(OWEStore, Res, Tab, Op, Args, erlang:system_time(millisecond)),
-    mnesia_lib:RptOp("FAILED mnesia_fdb_lib:~p(" ++ rpt_fmt(Args) ++ ") -> ~p~n",
+    maybe_store_error(OWEStore, TableId, Res, Tab, Op, Args, erlang:system_time(millisecond)),
+    mnesia_lib:RptOp("FAILED mfdb_lib:~p(" ++ rpt_fmt(Args) ++ ") -> ~p~n",
                      [Op | Args] ++ [Res]),
-    ?dbg("FAILED mnesia_fdb_lib:~p(" ++ rpt_fmt(Args) ++ ") -> ~p~n",
-         [Op | Args] ++ [Res]),
+    %%    ?dbg("FAILED mfdb_lib:~p(" ++ rpt_fmt(Args) ++ ") -> ~p~n",
+    %%         [Op | Args] ++ [Res]),
     if Rpt == fatal; Rpt == error ->
             throw(badarg);
        true ->
             ok
     end.
 
-maybe_store_error(undefined, _, _, _, _, _) ->
+maybe_store_error(undefined, _, _, _, _, _, _) ->
     ok;
-maybe_store_error(Table, Err, IntTable, put, [_, K, _, _], Time) ->
-    insert_error(Table, IntTable, K, Err, Time);
-maybe_store_error(Table, Err, IntTable, delete, [_, K, _], Time) ->
-    insert_error(Table, IntTable, K, Err, Time);
-maybe_store_error(Table, Err, IntTable, write, [_, List, _], Time) ->
+maybe_store_error(Table, TableId, Err, IntTable, put, [_, K, _, _], Time) ->
+    insert_error(Table, TableId, IntTable, K, Err, Time);
+maybe_store_error(Table, TableId, Err, IntTable, delete, [_, K, _], Time) ->
+    insert_error(Table, TableId, IntTable, K, Err, Time);
+maybe_store_error(Table, TableId, Err, IntTable, write, [_, List, _], Time) ->
     lists:map(fun
                   ({put, K, _}) ->
-                     insert_error(Table, IntTable, K, Err, Time);
+                     insert_error(Table, TableId, IntTable, K, Err, Time);
                   ({delete, K}) ->
-                     insert_error(Table, IntTable, K, Err, Time)
+                     insert_error(Table, TableId, IntTable, K, Err, Time)
              end, List).
 
-insert_error(Table, {Type, _, _}, K, Err, Time) ->
-    {_, K1} = decode_key(K),
+insert_error(Table, TableId, {Type, _, _}, K, Err, Time) ->
+    K1 = mfdb_lib:decode_key(TableId, K),
     ets:insert(Table, {{Type, K1}, Err, Time});
-insert_error(Table, Type, K, Err, Time) when is_atom(Type) ->
+insert_error(Table, _TableId, Type, K, Err, Time) when is_atom(Type) ->
     ets:insert(Table, {{Type, K}, Err, Time}).
 
 rpt_fmt([_|T]) ->
@@ -1062,41 +1381,6 @@ keypos({_, retainer, _}) ->
 keypos(Tab) when is_atom(Tab) ->
     2.
 
-decode_key(CodedKey) ->
-    case sext:partial_decode(CodedKey) of
-        {full, Result, _} ->
-            Result;
-        _ ->
-            error(badarg, CodedKey)
-    end.
-
-decode_val(Db, <<"mfdb_ref", Key/binary>>) ->
-    Parts = erlfdb:get_range_startswith(Db, Key),
-    binary_to_term(mnesia_fdb_lib:bin_join(Parts));
-decode_val(_Db, CodedVal) ->
-    binary_to_term(CodedVal).
-
-fold(_Alias, Tab0, Fun, Acc, MS, N) ->
-    #st{db = Db, tab = Tab, table_id = TableId, type = Type} = mnesia_fdb_manager:st(Tab0),
-    do_fold(Db, TableId, Tab, Type, Fun, Acc, MS, N).
-
-%% can be run on the server side.
-do_fold(Db, TableId, Tab, Type, Fun, Acc, MS, N) ->
-    {AccKeys, F} =
-        if is_function(Fun, 3) ->
-                {true, fun({K,Obj}, Acc1) ->
-                               Fun(Obj, K, Acc1)
-                       end};
-           is_function(Fun, 2) ->
-                {false, Fun}
-        end,
-    do_fold1(do_select(Db, TableId, Tab, Type, MS, AccKeys, N), F, Acc).
-
-do_fold1('$end_of_table', _, Acc) ->
-    Acc;
-do_fold1(L, Fun, Acc) ->
-    lists:foldl(Fun, Acc, L).
-
 is_wild('_') ->
     true;
 is_wild(A) when is_atom(A) ->
@@ -1121,30 +1405,31 @@ iter_cont(?IS_ITERATOR = Iterator) ->
 iter_cont(_) ->
     '$end_of_table'.
 
--spec iter_(Db :: ?IS_DB, TableId :: binary(), Tab :: atom(), Type :: atom(), StartKey :: any(), ReturnKeysOnly :: boolean(), NeedKeysOnly :: boolean(), Ms :: ets:comp_match_spec(), DataFun :: undefined | function(), InAcc :: list()) ->
+-spec iter_(Db :: ?IS_DB, TableId :: binary(), Tab :: binary(), MTab :: any(), StartKey :: any(), AccKeys :: boolean(), KeysOnly :: boolean(), Ms :: ets:comp_match_spec(), DataFun :: undefined | function(), InAcc :: list()) ->
                    {list(), '$end_of_table'} | {list(), ?IS_ITERATOR}.
-iter_(?IS_DB = Db, TableId, Tab, Type, StartKey, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, InAcc) ->
-    iter_(?IS_DB = Db, TableId, Tab, Type, StartKey, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, InAcc, 0).
+iter_(?IS_DB = Db, TableId, Tab, MTab, StartKey, AccKeys, KeysOnly, Ms, DataFun, InAcc) ->
+    iter_(?IS_DB = Db, TableId, Tab, MTab, StartKey, AccKeys, KeysOnly, Ms, DataFun, InAcc, 0).
 
--spec iter_(Db :: ?IS_DB, TableId :: binary(), Tab :: atom(), Type :: atom(), StartKey :: any(), ReturnKeysOnly :: boolean(), NeedKeysOnly :: boolean(), Ms :: ets:comp_match_spec(), DataFun :: undefined | function(), InAcc :: list(), DataLimit :: pos_integer()) ->
+-spec iter_(Db :: ?IS_DB, TableId :: binary(), Tab :: binary(), MTab :: any(), StartKey :: any(), AccKeys :: boolean(), KeysOnly :: boolean(), Ms :: ets:comp_match_spec(), DataFun :: undefined | function(), InAcc :: list(), DataLimit :: pos_integer()) ->
                    {list(), '$end_of_table'} | {list(), ?IS_ITERATOR}.
-iter_(?IS_DB = Db, TableId, Tab, Type, StartKey, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, InAcc, DataLimit) ->
+iter_(?IS_DB = Db, TableId, Tab, MTab, StartKey0, AccKeys, KeysOnly, Ms, DataFun, InAcc, DataLimit) ->
     Reverse = 0, %% we're not iterating in reverse
-    SKey = sext:prefix({TableId, ?DATA_PREFIX(Type), StartKey}),
-    EKey = erlfdb_key:strinc(sext:prefix({TableId, ?DATA_PREFIX(Type), ?FDB_END})),
+    ?dbg("Iter: ~p ~p~n", [TableId, StartKey0]),
+    {SKey, EKey} = iter_start_end_(TableId, StartKey0),
+    ?dbg("Iter: Start ~p End ~p~n", [SKey, EKey]),
     St0 = #iter_st{
              db = Db,
              table_id = TableId,
              tab = Tab,
-             type = Type,
+             mtab = MTab,
              data_limit = DataLimit,
              data_acc = InAcc,
              data_fun = DataFun,
-             return_keys_only = ReturnKeysOnly,
-             need_keys_only = NeedKeysOnly,
+             acc_keys = AccKeys,
+             keys_only = KeysOnly,
              compiled_ms = Ms,
              start_key = SKey,
-             start_sel = erlfdb_key:to_selector(erlfdb_key:first_greater_than(SKey)),
+             start_sel = erlfdb_key:to_selector(SKey),
              end_sel = erlfdb_key:to_selector(EKey),
              limit = 100, %% we use a fix limit of 100 for the number of KVs to pull
              target_bytes = 0,
@@ -1157,8 +1442,8 @@ iter_(?IS_DB = Db, TableId, Tab, Type, StartKey, ReturnKeysOnly, NeedKeysOnly, M
     iter_int_({cont, St}).
 
 iter_int_({cont, #iter_st{tx = Tx,
-                          table_id = TableId, tab = Tab,
-                          return_keys_only = ReturnKeysOnly, need_keys_only = NeedKeysOnly,
+                          table_id = TableId, mtab = MTab,
+                          acc_keys = AccKeys, keys_only = KeysOnly,
                           compiled_ms = Ms,
                           data_limit = DataLimit, %% Max rec in accum per continuation
                           data_count = DataCount, %% count in continuation accumulator
@@ -1172,13 +1457,10 @@ iter_int_({cont, #iter_st{tx = Tx,
         _ ->
             {Rows, HasMore, LastKey} = rows_more_last_(DataLimit, DataCount, RawRows,
                                                        Count, HasMore0),
-            %% io:format("Rows: ~p~n", [Rows]),
-            %% io:format("DataAcc: ~p~n", [DataAcc]),
             {NewDataAcc, AddCount} = iter_append_(Rows, Tx, TableId,
-                                                  Tab, ReturnKeysOnly, NeedKeysOnly, Ms,
+                                                  MTab, AccKeys, KeysOnly, Ms,
                                                   DataFun, 0, DataAcc),
-            %% io:format("NewDataAcc: ~p~n", [NewDataAcc]),
-            ?dbg("Count: ~p ~p ~p~n", [Count, HasMore, sext:decode(LastKey)]),
+            ?dbg("Count: ~p ~p ~p~n", [Count, HasMore, mfdb_lib:decode_key(TableId, LastKey)]),
             NewDataCount = DataCount + AddCount,
             HitLimit = hit_data_limit_(NewDataCount, DataLimit),
             Done = RawRows =:= []
@@ -1213,41 +1495,78 @@ iter_int_({cont, #iter_st{tx = Tx,
             end
     end.
 
-iter_append_([], _Tx, _TableId, _Tab, _ReturnKeysOnly,  _NeedKeysOnly, _Ms, _DataFun, AddCount, Acc) ->
+iter_append_([], _Tx, _TableId, _MTab, _AccKeys, _KeysOnly, _Ms, _DataFun, AddCount, Acc) ->
     {Acc, AddCount};
-iter_append_([{K, _V} | Rest], Tx, TableId, Tab, true = ReturnKeysOnly, true = NeedKeysOnly, Ms, DataFun, AddCount, Acc) ->
-    %% DataFun is not applied for key-only operations
-    Key = mnesia_fdb_lib:decode_key(K, TableId),
-    iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, NeedKeysOnly, Ms, DataFun, AddCount + 1, [Key | Acc]);
-iter_append_([{K, V} | Rest], Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount, Acc) ->
-    Key = mnesia_fdb_lib:decode_key(K, TableId),
-    Value = decode_val(Tx, V),
-    Rec = setelement(keypos(Tab), Value, Key),
-    %% io:format("Not keys only: ~p ~p~n", [Rec, Ms]),
-    case Ms =/= undefined andalso ets:match_spec_run([Rec], Ms) of
-        false  when is_function(DataFun, 2) ->
+iter_append_([{K, V} | Rest], Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount, Acc) ->
+    IsIndexTbl = not is_atom(MTab),
+    case mfdb_lib:decode_key(TableId, K) of
+        {idx, {{IK, IV}} = Idx} when IsIndexTbl andalso is_function(DataFun, 3) ->
             %% Record matched specification, is a fold operation, apply the supplied DataFun
-            NAcc = DataFun(Rec, Acc),
-            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, NAcc);
-        false ->
-            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, [iter_val_(ReturnKeysOnly, Key, Rec) | Acc]);
-        [] ->
-            %% Record did not match specification
-            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount, Acc);
-        [_Match] when DataFun =:= undefined ->
-            %% Record matched specification, but not a fold operation
-            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, [iter_val_(ReturnKeysOnly, Key, Rec) | Acc]);
-        [_Match] when is_function(DataFun, 2) ->
-            %% Record matched specification, is a fold operation, apply the supplied DataFun
-            NAcc = DataFun(Rec, Acc),
-            iter_append_(Rest, Tx, TableId, Tab, ReturnKeysOnly, _NeedKeysOnly, Ms, DataFun, AddCount + 1, NAcc)
+            case not lists:member({IK,IV}, Acc) of
+                true ->
+                    NAcc = DataFun(Tx, Idx, Acc),
+                    ?dbg("match with Fun: ~p => ~p~n~p~n", [Idx, NAcc =/= Acc, NAcc]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc);
+                false ->
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, Acc)
+            end;
+        {idx, {{IK, IV}} = Idx} when IsIndexTbl ->
+            case not lists:member({IK,IV}, Acc) andalso Ms =/= undefined andalso ets:match_spec_run([Idx], Ms) of
+                false ->
+                    ?dbg("No MS Acc: ~p ~p", [Idx, Acc]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, Acc);
+                [] ->
+                    ?dbg("Not matched Acc: ~p ~p", [Idx, Acc]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, Acc);
+                [Match] ->
+                    NAcc = [Match | Acc],
+                    ?dbg("Index ~p Acc: ~p", [Idx, NAcc]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc)
+            end;
+        Key when not IsIndexTbl ->
+            ?dbg("decoded_key: ~p", [Key]),
+            Value = mfdb_lib:decode_val(Tx, TableId, V),
+            Rec = setelement(keypos(MTab), Value, Key),
+            case Ms =/= undefined andalso ets:match_spec_run([Rec], Ms) of
+                false  when is_function(DataFun, 2) ->
+                    %% Record matched specification, is a fold operation, apply the supplied DataFun
+                    NAcc = DataFun(Rec, Acc),
+                    ?dbg("match with Fun: ~p => ~p", [Rec, NAcc =/= Acc]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc);
+                false  when is_function(DataFun, 3) ->
+                    %% Record matched specification, is a fold operation, apply the supplied DataFun
+                    NAcc = DataFun(Tx, Rec, Acc),
+                    ?dbg("match with Fun: ~p => ~p", [Rec, NAcc =/= Acc]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc);
+                false ->
+                    NAcc = [iter_val_(KeysOnly, Key, Rec) | Acc],
+                    ?dbg("got match: ~p", [Rec]),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc);
+                [] ->
+                    %% Record did not match specification
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount, Acc);
+                [Match] when DataFun =:= undefined ->
+                    ?dbg("got match: ~p ~p ~p", [Match, AccKeys, KeysOnly]),
+                    %% Record matched specification, but not a fold operation
+                    NAcc = case AccKeys of
+                               true ->
+                                   [{Key, Match} | Acc];
+                               false ->
+                                   [Match | Acc]
+                           end,
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc);
+                [Match] when is_function(DataFun, 2) ->
+                    %% Record matched specification, is a fold operation, apply the supplied DataFun
+                    ?dbg("got match with Fun: ~p", [Match]),
+                    NAcc = DataFun(Match, Acc),
+                    iter_append_(Rest, Tx, TableId, MTab, AccKeys, KeysOnly, Ms, DataFun, AddCount + 1, NAcc)
+            end
     end.
 
 iter_val_(true, Key, _Rec) ->
     Key;
 iter_val_(false, _Key, Rec) ->
     Rec.
-
 
 iter_future_(#iter_st{tx = Tx, start_sel = StartKey,
                       end_sel = EndKey, limit = Limit,
@@ -1286,6 +1605,27 @@ iter_commit_(undefined) ->
 iter_commit_(?IS_TX = Tx) ->
     catch erlfdb:wait(erlfdb:commit(Tx)),
     ok.
+
+iter_start_end_(TableId, StartKey0) ->
+    case StartKey0 of
+        {range, S0, E0} ->
+            S = case S0 of
+                    {S1k, S1} when S1k =:= fdb orelse S1k =:= fdbr ->
+                        erlfdb_key:first_greater_or_equal(S1);
+                    S0 ->
+                        mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, S0})
+                end,
+            E = case E0 of
+                    {E1k, E1} when E1k =:= fdb orelse E1k =:= fdbr ->
+                        E1;
+                    E0 ->
+                        erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, E0}))
+                end,
+            {S, E};
+        StartKey0 ->
+            {erlfdb_key:first_greater_than(StartKey0),
+             erlfdb_key:strinc(StartKey0)}
+    end.
 
 hit_data_limit_(_DataCount, 0) ->
     false;
