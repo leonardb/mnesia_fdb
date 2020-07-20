@@ -900,7 +900,7 @@ value_size_guard_([#idx{pos = P} | Rest], #st{table_id = TableId, attributes = A
     EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Idx}),
     ByteSize = byte_size(EncKey),
     case ByteSize of
-        X when X > 50 ->
+        X when X > ?MAX_KEY_SIZE ->
             IdxCol = lists:nth(P - 1, Attrib),
             {error, IdxCol};
         _ ->
