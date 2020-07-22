@@ -13,7 +13,7 @@ start_link() ->
 init([]) ->
     Spec = {mfdb_reaper,
             {mfdb_reaper, start_link, []},
-            temporary, 1000, worker, [mfdb_reaper]},
+            transient, 1000, worker, [mfdb_reaper]},
     {ok, { {simple_one_for_one, 5, 10}, [Spec]} }.
 
 add_reaper(TableName, TableId, TTL) ->

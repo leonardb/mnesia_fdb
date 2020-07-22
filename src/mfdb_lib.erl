@@ -56,7 +56,7 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, ttl
         false ->
             erlfdb:wait(erlfdb:set(Tx, EncKey, V))
     end,
-    put_ttl(Tx, TableId, TTL, EncKey),
+    put_ttl(Tx, TableId, TTL, K),
     erlfdb:wait(erlfdb:commit(Tx));
 put(#st{db = Db, mtab = {_, index, {KeyPos, _}}, index = Indexes}, {V0, K}, {[]}) ->
     ?dbg("Adding data index: ~p ~p ~p", [K, V0, Indexes]),
@@ -73,10 +73,30 @@ put(#st{db = Db, mtab = {_, index, {KeyPos, _}}, index = Indexes}, {V0, K}, {[]}
 
 put_ttl(_Tx, _TableId, undefined, _Key) ->
     ok;
-put_ttl(Tx, TableId, _TTL, Key) ->
-    ExpKey = encode_key(TableId, {<<"t">>, unixtime()}),
-    ?dbg("Adding TTL: Key ~p", [ExpKey]),
-    erlfdb:wait(erlfdb:set(Tx, ExpKey, Key)).
+put_ttl(Tx, TableId, TTL, Key) ->
+    %% We need to be able to lookup in both directions
+    %% since we use a range query for reaping expired records
+    %% and we also need to remove the previous entry if a record gets updated
+    ttl_remove_(Tx, TableId, TTL, Key),
+    Now = unixtime(),
+    ?dbg("Adding TTL Keys: ~p and ~p", [{<<"ttl-t2k">>, Now, Key}, {<<"ttl-k2t">>, Key}]),
+    erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {<<"ttl-t2k">>, Now, Key}), <<>>)),
+    erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {<<"ttl-k2t">>, Key}), integer_to_binary(Now, 10))).
+
+ttl_remove_(_Tx, _TableId, undefined, _Key) ->
+    ok;
+ttl_remove_(Tx, TableId, _TTL, Key) ->
+    ?dbg("Removing TTL refs: ~p ~p", [TableId, Key]),
+    TtlK2T = encode_key(TableId, {<<"ttl-k2t">>, Key}),
+    case erlfdb:wait(erlfdb:get(Tx, TtlK2T)) of
+        not_found ->
+            ok;
+        Added ->
+            OldTtlT2K = {<<"ttl-t2k">>, binary_to_integer(Added, 10), Key},
+            erlfdb:wait(erlfdb:clear(Tx, encode_key(TableId, OldTtlT2K)))
+
+    end,
+    erlfdb:wait(erlfdb:clear(Tx, encode_key(TableId, {<<"ttl-k2t">>, Key}))).
 
 add_data_indexes_(Tx, K, Val, #idx{table_id = TableId}) ->
     EncKey = idx_count_key(TableId, Val),
@@ -107,15 +127,15 @@ delete(#st{db = Db, mtab = {_, index, {KeyPos, _}}, index = Indexes}, {V0, Key})
             ok = remove_data_indexes_(Tx, V0, Key, Idx),
             ok = erlfdb:wait(erlfdb:commit(Tx))
     end;
-delete(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab}, K) when is_atom(MTab) ->
+delete(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, ttl = TTL}, K) when is_atom(MTab) ->
     %% deleting a data item
     Tx = erlfdb:create_transaction(Db),
-    do_delete_data_(Tx, TableId, true, K);
-delete(#st{db = ?IS_TX = Tx, table_id = TableId}, K) ->
+    do_delete_data_(Tx, TableId, true, TTL, K);
+delete(#st{db = ?IS_TX = Tx, table_id = TableId, ttl = TTL}, K) ->
     %% When db is a transaction we do _NOT_ commit, it's the caller's responsibility
-    do_delete_data_(Tx, TableId, false, K).
+    do_delete_data_(Tx, TableId, false, TTL, K).
 
-do_delete_data_(Tx, TableId, DoCommit, K) ->
+do_delete_data_(Tx, TableId, DoCommit, TTL, K) ->
     EncKey = encode_key(TableId, {<<"d">>, K}),
     case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
         not_found ->
@@ -136,6 +156,7 @@ do_delete_data_(Tx, TableId, DoCommit, K) ->
             erlfdb:add(Tx, tbl_count_key(TableId), -1)
     end,
     ok = erlfdb:wait(erlfdb:clear(Tx, EncKey)),
+    ttl_remove_(Tx, TableId, TTL, K),
     case DoCommit of
         true ->
             ok = erlfdb:wait(erlfdb:commit(Tx));
@@ -220,6 +241,10 @@ decode_key(TableId, <<S:8, R/binary>>) ->
             {cnt_idx, Key};
         {<<"p">>, PartHcaVal} ->
             PartHcaVal;
+        {<<"ttl-t2k">>, _, Key} ->
+            Key;
+        {<<"ttl-k2t">>, Key} ->
+            Key;
         BadVal ->
             exit({TableId, BadVal})
     end.
@@ -238,11 +263,6 @@ encode_key(TableId, Key) ->
 
 encode_prefix(TableId, Key) ->
     <<(bit_size(TableId)):8, TableId/binary, (sext:prefix(Key))/binary>>.
-
-encode_value(Val0) ->
-    Val = term_to_binary(Val0),
-    Size = byte_size(Val),
-    <<Size:32, Val/binary>>.
 
 tbl_count_key(TableId) ->
     encode_key(TableId, {<<"c">>}).
@@ -331,4 +351,4 @@ datetime_to_unix({Mega, Secs, _}) ->
     (Mega * 1000000) + Secs;
 datetime_to_unix({{Y,Mo,D},{H,Mi,S}}) ->
     calendar:datetime_to_gregorian_seconds(
-        {{Y,Mo,D},{H,Mi,round(S)}}) - ?SECONDS_TO_EPOCH.
+      {{Y,Mo,D},{H,Mi,round(S)}}) - ?SECONDS_TO_EPOCH.

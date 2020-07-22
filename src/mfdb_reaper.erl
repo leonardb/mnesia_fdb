@@ -62,28 +62,31 @@ poll_timer(TRef) when is_reference(TRef) ->
 
 reap_expired(TableName, TableId, TTL) ->
     ?dbg("Reaping: ~p ~p ~p~n", [TableName, TableId, TTL]),
-    RangeStart = mfdb_lib:encode_key(TableId, {<<"t">>, 0}),
-    ?dbg("Range start: mfdb_lib:encode_key(~p, {<<\"t\">>, 0})", [TableId]),
+    %% TTL -> Key :: encode_key(TableId, {<<"ttl-t2k">>, binary_to_integer(Added, 10), Key})
+    %% Key -> TTL :: encode_key(TableId, {<<"ttl-k2t">>, Key})
+    RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, 0, ?FDB_WC}),
+    ?dbg("Range start: mfdb_lib:encode_prefix(~p, {<<\"ttl-t2k\">>, 0, ~p})", [TableId, ?FDB_WC]),
     End = mfdb_lib:unixtime() - TTL,
-    RangeEnd = mfdb_lib:encode_key(TableId, {<<"t">>, End}),
-    ?dbg("Range end: mfdb_lib:encode_key(~p, {<<\"t\">>, ~p})", [TableId, End]),
+    RangeEnd = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, End, ?FDB_END}),
+    ?dbg("Range end: mfdb_lib:encode_prefix(~p, {<<\"ttl-t2k\">>, ~p, ~p})", [TableId, End, ?FDB_END]),
     Conn = mfdb_manager:db_conn_(),
     reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd).
 
 reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
-    Tx = erlfdb:create_transaction(Conn),
-    case erlfdb:wait(erlfdb:get_range(Tx, RangeStart, erlfdb_key:strinc(RangeEnd), [{limit, 1000}])) of
+    case erlfdb:get_range(Conn, RangeStart, erlfdb_key:strinc(RangeEnd), [{limit, 1000}]) of
         [] ->
             ok;
         KVs ->
             LastKey = lists:foldl(
-                        fun({Key, Ref}, _) ->
-                                RKey = mfdb_lib:decode_key(TableId, Ref),
+                        fun({EncKey, <<>>}, _) ->
+                                RKey = mfdb_lib:decode_key(TableId, EncKey),
                                 ?dbg("Delete ~p from ~p", [RKey, TableName]),
-                                mnesia:dirty_delete(TableName, RKey),
-                                Key
+                                ok = mnesia:dirty_delete(TableName, RKey),
+                                %% Key2Ttl have to be removed individually
+                                TtlK2T = mfdb_lib:encode_key(TableId, {<<"ttl-k2t">>, RKey}),
+                                ok = erlfdb:clear(Conn, TtlK2T),
+                                EncKey
                         end, ok, KVs),
-            erlfdb:wait(erlfdb:clear_range(Tx, RangeStart, erlfdb_key:strinc(LastKey))),
-            erlfdb:wait(erlfdb:commit(Tx)),
+            ok = erlfdb:clear_range(Conn, RangeStart, erlfdb_key:strinc(LastKey)),
             reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd)
     end.
