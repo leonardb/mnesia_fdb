@@ -34,6 +34,8 @@ init([TableName, TableId, TTL]) ->
     Conn = mfdb_manager:db_conn_(),
     {ok, #state{conn = Conn, table_name = TableName, table_id = TableId, ttl = TTL}}.
 
+handle_call(stop, _From, #state{} = State) ->
+    {stop, normal, ok, State};
 handle_call(_Request, _From, #state{} = State) ->
     {reply, ok, State}.
 
@@ -62,7 +64,7 @@ poll_timer(TRef) when is_reference(TRef) ->
     erlang:send_after(?REAP_POLL_INTERVAL, self(), poll).
 
 reap_expired(Conn, TableName, TableId, TTL) ->
-    ?dbg("Reaping: ~p ~p ~p~n", [TableName, TableId, TTL]),
+    ?dbg("Reaping ~p: ~p ~p ~p~n", [self(), TableName, TableId, TTL]),
     %% TTL -> Key :: encode_key(TableId, {<<"ttl-t2k">>, binary_to_integer(Added, 10), Key})
     %% Key -> TTL :: encode_key(TableId, {<<"ttl-k2t">>, Key})
     RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, 0, ?FDB_WC}),

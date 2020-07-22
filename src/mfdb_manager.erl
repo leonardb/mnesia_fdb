@@ -396,9 +396,16 @@ stop_reaper(TabName) ->
     case whereis(Reaper) of
         undefined ->
             ok;
-        ReaperPid ->
-            gen_server:stop(ReaperPid)
-    end.
+        _RPid ->
+            try gen_server:call(Reaper, stop, infinity) of
+                ok ->
+                 supervisor:delete_child(mfdb_reaper_sup, Reaper)
+            catch
+                _:_ ->
+                    ok
+            end
+    end,
+    ok.
 
 create_index_({_, index, {Pos, _}} = Tab, Db, #st{index = Indexes0} = Parent) ->
     case element(Pos, Indexes0) of

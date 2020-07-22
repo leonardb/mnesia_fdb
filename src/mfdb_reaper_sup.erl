@@ -15,7 +15,7 @@ init([]) ->
 
 add_reaper(TableName, TableId, TTL) ->
     ReaperName = list_to_atom("mfdb_reaper_" ++ atom_to_list(TableName)),
-    Spec = {mfdb_reaper,
+    Spec = {ReaperName,
             {mfdb_reaper, start_link, [ReaperName, TableName, TableId, TTL]},
             transient, 1000, worker, [mfdb_reaper]},
     try supervisor:start_child(?MODULE, Spec) of
@@ -24,8 +24,7 @@ add_reaper(TableName, TableId, TTL) ->
         {error, {already_started, _Pid}} ->
             ok;
         {error, already_present} ->
-            Pid = whereis(ReaperName),
-            supervisor:terminate_child(?MODULE, Pid),
+            supervisor:terminate_child(?MODULE, ReaperName),
             add_reaper(TableName, TableId, TTL);
         OtherError ->
             OtherError
