@@ -17,11 +17,13 @@
          idx_count_key/2,
          table_count/1,
          table_data_size/1,
-         update_counter/3]).
+         update_counter/3,
+         unixtime/0]).
 
 -include("mfdb.hrl").
+-define(SECONDS_TO_EPOCH, (719528*24*3600)).
 
-put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef}, K, V0) when is_atom(MTab) ->
+put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, ttl = TTL}, K, V0) when is_atom(MTab) ->
     %% Operation is on a data table
     ?dbg("Data insert: ~p", [{K, V0}]),
     EncKey = encode_key(TableId, {<<"d">>, K}),
@@ -54,6 +56,7 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef}, K,
         false ->
             erlfdb:wait(erlfdb:set(Tx, EncKey, V))
     end,
+    put_ttl(Tx, TableId, TTL, EncKey),
     erlfdb:wait(erlfdb:commit(Tx));
 put(#st{db = Db, mtab = {_, index, {KeyPos, _}}, index = Indexes}, {V0, K}, {[]}) ->
     ?dbg("Adding data index: ~p ~p ~p", [K, V0, Indexes]),
@@ -67,6 +70,13 @@ put(#st{db = Db, mtab = {_, index, {KeyPos, _}}, index = Indexes}, {V0, K}, {[]}
             ok = erlfdb:wait(erlfdb:commit(Tx))
     end,
     ok.
+
+put_ttl(_Tx, _TableId, undefined, _Key) ->
+    ok;
+put_ttl(Tx, TableId, _TTL, Key) ->
+    ExpKey = encode_key(TableId, {<<"t">>, unixtime()}),
+    ?dbg("Adding TTL: Key ~p", [ExpKey]),
+    erlfdb:wait(erlfdb:set(Tx, ExpKey, Key)).
 
 add_data_indexes_(Tx, K, Val, #idx{table_id = TableId}) ->
     EncKey = idx_count_key(TableId, Val),
@@ -312,3 +322,13 @@ update_counter(Tx, EncKey, Incr) ->
             NewVal = erlfdb:wait(erlfdb:get(Tx, EncKey)),
             {ok, NewVal}
     end.
+
+
+unixtime() ->
+    datetime_to_unix(erlang:universaltime()).
+
+datetime_to_unix({Mega, Secs, _}) ->
+    (Mega * 1000000) + Secs;
+datetime_to_unix({{Y,Mo,D},{H,Mi,S}}) ->
+    calendar:datetime_to_gregorian_seconds(
+        {{Y,Mo,D},{H,Mi,round(S)}}) - ?SECONDS_TO_EPOCH.

@@ -57,7 +57,8 @@ load_table(Tab0, _Default) ->
     Tab = tab_name_(Tab0),
     ?dbg("LOOKUP TABLE ~p~n", [Tab0]),
     try ets:lookup(?MODULE, Tab) of
-        [#st{tab = Tab, info = Infos} = Rec] ->
+        [#st{table_id = TableId, tab = Tab, info = Infos, ttl = TTL} = Rec] ->
+            ok = init_reaper(Tab0, TableId, TTL),
             write_ets_infos_(Infos),
             Rec;
         [] ->
@@ -69,7 +70,8 @@ load_table(Tab0, _Default) ->
 load_if_exists(Tab0) ->
     Tab = tab_name_(Tab0),
     try ets:lookup(?MODULE, Tab) of
-        [#st{tab = Tab, info = Infos}] ->
+        [#st{table_id = TableId, tab = Tab, info = Infos, ttl = TTL}] ->
+            ok = init_reaper(Tab0, TableId, TTL),
             write_ets_infos_(Infos),
             ok;
         [] ->
@@ -269,14 +271,15 @@ delete_table_({Parent0, index, {Pos, _}}) ->
 delete_table_(Tab0) ->
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
+    stop_reaper(Tab0),
     [#st{index = Indexes0, table_id = TableId}] = ets:lookup(?MODULE, Tab),
     %% Remove indexes
     [clear_index(Db, IdxTabId) || #idx{table_id = IdxTabId} <- tuple_to_list(Indexes0)],
     ok = clear_table(Db, TableId),
     ok = erlfdb:clear(Db, <<"tbl_", Tab/binary>>),
     ok = erlfdb:clear(Db, <<"tbl_", Tab/binary, "_settings">>),
-    ets:select_delete(?MODULE, [{#info{k = {Tab, '_'}, _ = '_'}, [], [true]}]),
-    ets:select_delete(?MODULE, [{#info{k = {Tab, '_', '_'}, _ = '_'}, [], [true]}]),
+    ets:select_delete(?MODULE, [{#info{k = {Tab, ?FDB_WC}, _ = '_'}, [], [true]}]),
+    ets:select_delete(?MODULE, [{#info{k = {Tab, ?FDB_WC, ?FDB_WC}, _ = '_'}, [], [true]}]),
     ets:delete(?MODULE, Tab),
     ok.
 
@@ -292,10 +295,10 @@ clear_index(Db, TableId) ->
 clear_table(Db, TableId) ->
     ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"c">>})),
     ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"s">>})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_', '_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_'})).
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC, ?FDB_WC, ?FDB_WC})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC, ?FDB_WC})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC})).
 
 mk_tab_(Db, TableId, Tab, MTab, Props) ->
     Alias = proplists:get_value(alias, Props, fdb_copies),
@@ -306,6 +309,8 @@ mk_tab_(Db, TableId, Tab, MTab, Props) ->
     HcaRef = erlfdb_hca:create(<<TableId/binary, "_hca_ref">>),
     IdxTuple = list_to_tuple(lists:duplicate(length(Attributes) + 1, undefined)),
     Indexes = proplists:get_value(index, Props, []),
+    UserProperties = proplists:get_value(user_properties, Props, []),
+    TTL = proplists:get_value(ttl, UserProperties, undefined),
     St = #st{
             tab                  = Tab,
             mtab                 = MTab,
@@ -313,6 +318,7 @@ mk_tab_(Db, TableId, Tab, MTab, Props) ->
             record_name          = RecordName,
             attributes           = Attributes,
             index                = IdxTuple,
+            ttl                  = TTL,
             on_write_error       = OnWriteError,
             on_write_error_store = OnWriteErrorStore,
             db                   = Db,
@@ -370,13 +376,28 @@ create_table_(Tab0, Props) when is_atom(Tab0) ->
             Hca = erlfdb_hca:create(<<"hca_table">>),
             TableId0 = erlfdb_hca:allocate(Hca, Db),
             ?dbg("MAKE TABLE ~p~n", [Tab]),
-            #st{info = Infos} = Table0 = mk_tab_(Db, TableId0, Tab, Tab0, Props),
+            #st{info = Infos, ttl = TTL} = Table0 = mk_tab_(Db, TableId0, Tab, Tab0, Props),
             ok = erlfdb:set(Db, TabKey, term_to_binary(Table0)),
             true = ets:insert(?MODULE, Table0),
             write_ets_infos_(Infos),
+            ok = init_reaper(Tab0, TableId0, TTL),
             ok;
         ok ->
             ok
+    end.
+
+init_reaper(_TabName, _TableId, undefined) ->
+    ok;
+init_reaper(TabName, TableId, TTL) ->
+    mfdb_reaper_sup:add_reaper(TabName, TableId, TTL).
+
+stop_reaper(TabName) ->
+    Reaper = list_to_atom("mfdb_reaper_" ++ atom_to_list(TabName)),
+    case whereis(Reaper) of
+        undefined ->
+            ok;
+        ReaperPid ->
+            gen_server:stop(ReaperPid)
     end.
 
 create_index_({_, index, {Pos, _}} = Tab, Db, #st{index = Indexes0} = Parent) ->
@@ -406,11 +427,12 @@ load_table_(Tab0) ->
         not_found ->
             {error, not_found};
         Table0 ->
-            #st{info = Infos} = Table1 = binary_to_term(Table0),
+            #st{table_id = TableId, ttl = TTL, info = Infos} = Table1 = binary_to_term(Table0),
             Table2 = Table1#st{db = Db},
             ok = erlfdb:set(Db, TabKey, term_to_binary(Table2)),
             true = ets:insert(?MODULE, Table2),
             write_ets_infos_(Infos),
+            init_reaper(Tab0, TableId, TTL),
             ok
     end.
 

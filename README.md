@@ -2,12 +2,10 @@
 
 A FoundationDB backend for Mnesia.
 
-**We're looking for contributors.**
+**Looking for contributors and feedback**
 
 Permits Erlang/OTP applications to use FoundationDB as a backend for
 mnesia tables. It is based on Aeternity's `mnesia_rocksdb` which was based on Klarna's `mnesia_eleveldb`.
-
-Contributions and feedback are welcome.
 
 **WARNING** This is not considered safe for production yet.
 
@@ -65,6 +63,10 @@ starting mnesia.
 Put `{fdb_copies, [node()]}` into the table definitions of
 tables you want to be in FoundationDB.
 
+mnesia_fdb additionally supports a per table TTL setting.
+```
+mnesia:create_table(test, [{fdb_copies, [node()]}, ..., {user_properties, [{ttl, 60}]}]).
+```
 
 ## Special features
 
