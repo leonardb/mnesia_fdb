@@ -11,14 +11,14 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Spec = {mfdb_reaper,
-            {mfdb_reaper, start_link, []},
-            transient, 1000, worker, [mfdb_reaper]},
-    {ok, { {simple_one_for_one, 5, 10}, [Spec]} }.
+    {ok, { {one_for_one, 5, 10}, []} }.
 
 add_reaper(TableName, TableId, TTL) ->
     ReaperName = list_to_atom("mfdb_reaper_" ++ atom_to_list(TableName)),
-    try supervisor:start_child(?MODULE, [ReaperName, TableName, TableId, TTL]) of
+    Spec = {mfdb_reaper,
+            {mfdb_reaper, start_link, [ReaperName, TableName, TableId, TTL]},
+            transient, 1000, worker, [mfdb_reaper]},
+    try supervisor:start_child(?MODULE, Spec) of
         {ok, _Pid} ->
             ok;
         {error, {already_started, _Pid}} ->
