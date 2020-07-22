@@ -19,9 +19,9 @@
 -include("mfdb.hrl").
 
 -define(SERVER, ?MODULE).
--define(REAP_POLL_INTERVAL, 30000).
+-define(REAP_POLL_INTERVAL, 500).
 
--record(state, {table_name, table_id, ttl, timer = poll_timer(undefined)}).
+-record(state, {conn, table_name, table_id, ttl, timer = poll_timer(undefined)}).
 
 %%%===================================================================
 %%% Spawning and gen_server implementation
@@ -31,7 +31,8 @@ start_link(ReaperName, TableName, TableId, TTL) ->
     gen_server:start_link({local, ReaperName}, ?MODULE, [TableName, TableId, TTL], []).
 
 init([TableName, TableId, TTL]) ->
-    {ok, #state{table_name = TableName, table_id = TableId, ttl = TTL}}.
+    Conn = mfdb_manager:db_conn_(),
+    {ok, #state{conn = Conn, table_name = TableName, table_id = TableId, ttl = TTL}}.
 
 handle_call(_Request, _From, #state{} = State) ->
     {reply, ok, State}.
@@ -39,8 +40,8 @@ handle_call(_Request, _From, #state{} = State) ->
 handle_cast(_Request, #state{} = State) ->
     {noreply, State}.
 
-handle_info(poll, #state{table_name = TableName, table_id = TableId, ttl = TTL, timer = Timer} = State) ->
-    ok = reap_expired(TableName, TableId, TTL),
+handle_info(poll, #state{conn = Conn, table_name = TableName, table_id = TableId, ttl = TTL, timer = Timer} = State) ->
+    ok = reap_expired(Conn, TableName, TableId, TTL),
     {noreply, State#state{timer = poll_timer(Timer)}};
 handle_info(_Info, #state{} = State) ->
     {noreply, State}.
@@ -60,7 +61,7 @@ poll_timer(TRef) when is_reference(TRef) ->
     erlang:cancel_timer(TRef),
     erlang:send_after(?REAP_POLL_INTERVAL, self(), poll).
 
-reap_expired(TableName, TableId, TTL) ->
+reap_expired(Conn, TableName, TableId, TTL) ->
     ?dbg("Reaping: ~p ~p ~p~n", [TableName, TableId, TTL]),
     %% TTL -> Key :: encode_key(TableId, {<<"ttl-t2k">>, binary_to_integer(Added, 10), Key})
     %% Key -> TTL :: encode_key(TableId, {<<"ttl-k2t">>, Key})
@@ -69,7 +70,6 @@ reap_expired(TableName, TableId, TTL) ->
     End = mfdb_lib:unixtime() - TTL,
     RangeEnd = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, End, ?FDB_END}),
     ?dbg("Range end: mfdb_lib:encode_prefix(~p, {<<\"ttl-t2k\">>, ~p, ~p})", [TableId, End, ?FDB_END]),
-    Conn = mfdb_manager:db_conn_(),
     reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd).
 
 reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
