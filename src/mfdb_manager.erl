@@ -59,7 +59,7 @@ load_table(Tab0, _Default) ->
     ?dbg("LOOKUP TABLE ~p~n", [Tab0]),
     try ets:lookup(?MODULE, Tab) of
         [#st{table_id = TableId, tab = Tab, info = Infos, ttl = TTL} = Rec] ->
-            ok = init_reaper(Tab0, TableId, TTL),
+            ok = reaper_start(Tab0, TableId, TTL),
             write_ets_infos_(Infos),
             Rec;
         [] ->
@@ -72,7 +72,7 @@ load_if_exists(Tab0) ->
     Tab = tab_name_(Tab0),
     try ets:lookup(?MODULE, Tab) of
         [#st{table_id = TableId, tab = Tab, info = Infos, ttl = TTL}] ->
-            ok = init_reaper(Tab0, TableId, TTL),
+            ok = reaper_start(Tab0, TableId, TTL),
             write_ets_infos_(Infos),
             ok;
         [] ->
@@ -104,14 +104,14 @@ set_ttl(Tab0, TTL) when is_atom(Tab0) ->
     PTabKey = <<"tbl_", Tab/binary, "_settings">>,
     case ets:lookup(?MODULE, Tab) of
         [#st{ttl = TTL}] ->
-            %% do nothing
+            %% do nothing, TTL has not changed
             ok;
         [#st{db = Db, table_id = TableId, ttl = undefined} = St] when is_integer(TTL) ->
-            %% Add TTL to table
+            %% Add TTL to table and start the reaper
             NSt = St#st{ttl = TTL},
             ets:insert(?MODULE, {Tab, NSt}),
             ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
-            ok = init_reaper(Tab0, TableId, TTL),
+            ok = reaper_start(Tab0, TableId, TTL),
             ok;
         [#st{db = Db, table_id = TableId} = St] when TTL =:= undefined ->
             %% remove TTL from table, including removing all
@@ -119,18 +119,17 @@ set_ttl(Tab0, TTL) when is_atom(Tab0) ->
             NSt = St#st{ttl = undefined},
             ets:insert(?MODULE, {Tab, NSt}),
             ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
-            stop_reaper(Tab0),
+            ok = reaper_stop(Tab0),
             RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, ?FDB_WC, ?FDB_WC}),
             ok = erlfdb:clear_range_startswith(Db, RangeStart),
             ok;
         [#st{db = Db, table_id = TableId, ttl = OTTL} = St] when is_integer(OTTL) andalso is_integer(TTL) ->
-            %% remove TTL from table, including removing all
-            %% related TTL entries for existing records
+            %% change the TTL setting in the reaper by restarting it
             NSt = St#st{ttl = undefined},
             ets:insert(?MODULE, {Tab, NSt}),
             ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
-            stop_reaper(Tab0),
-            ok = init_reaper(Tab0, TableId, TTL),
+            ok = reaper_stop(Tab0),
+            ok = reaper_start(Tab0, TableId, TTL),
             ok;
         _ ->
             badarg
@@ -310,7 +309,7 @@ delete_table_({Parent0, index, {Pos, _}}) ->
 delete_table_(Tab0) ->
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
-    stop_reaper(Tab0),
+    reaper_stop(Tab0),
     [#st{index = Indexes0, table_id = TableId}] = ets:lookup(?MODULE, Tab),
     %% Remove indexes
     [clear_index(Db, IdxTabId) || #idx{table_id = IdxTabId} <- tuple_to_list(Indexes0)],
@@ -415,18 +414,18 @@ create_table_(Tab0, Props) when is_atom(Tab0) ->
             ok = erlfdb:set(Db, TabKey, term_to_binary(Table0)),
             true = ets:insert(?MODULE, Table0),
             write_ets_infos_(Infos),
-            ok = init_reaper(Tab0, TableId0, TTL),
+            ok = reaper_start(Tab0, TableId0, TTL),
             ok;
         ok ->
             ok
     end.
 
-init_reaper(_TabName, _TableId, undefined) ->
+reaper_start(_TabName, _TableId, undefined) ->
     ok;
-init_reaper(TabName, TableId, TTL) ->
+reaper_start(TabName, TableId, TTL) ->
     mfdb_reaper_sup:add_reaper(TabName, TableId, TTL).
 
-stop_reaper(TabName) ->
+reaper_stop(TabName) ->
     Reaper = list_to_atom("mfdb_reaper_" ++ atom_to_list(TabName)),
     case whereis(Reaper) of
         undefined ->
@@ -474,7 +473,7 @@ load_table_(Tab0) ->
             ok = erlfdb:set(Db, TabKey, term_to_binary(Table2)),
             true = ets:insert(?MODULE, Table2),
             write_ets_infos_(Infos),
-            init_reaper(Tab0, TableId, TTL),
+            reaper_start(Tab0, TableId, TTL),
             ok
     end.
 
