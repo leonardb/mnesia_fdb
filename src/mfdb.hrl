@@ -71,8 +71,6 @@
          attributes                                         :: list(atom()),
          index                                              :: tuple(),
          ttl                    = undefined                 :: undefined | pos_integer(),
-         on_write_error         = ?WRITE_ERR_DEFAULT        :: on_write_error(),
-         on_write_error_store   = ?WRITE_ERR_STORE_DEFAULT  :: on_write_error_store(),
          db                                                 :: db(),
          table_id                                           :: binary(),
          hca_ref,   %% opaque :: #erlfdb_hca{} record used for mfdb_part() keys    :: erlfdb_hca:create(<<"parts_", TableId/binary>>).

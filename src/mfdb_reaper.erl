@@ -64,14 +64,9 @@ poll_timer(TRef) when is_reference(TRef) ->
     erlang:send_after(?REAP_POLL_INTERVAL, self(), poll).
 
 reap_expired(Conn, TableName, TableId, TTL) ->
-    ?dbg("Reaping ~p: ~p ~p ~p~n", [self(), TableName, TableId, TTL]),
-    %% TTL -> Key :: encode_key(TableId, {<<"ttl-t2k">>, binary_to_integer(Added, 10), Key})
-    %% Key -> TTL :: encode_key(TableId, {<<"ttl-k2t">>, Key})
     RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, 0, ?FDB_WC}),
-    ?dbg("Range start: mfdb_lib:encode_prefix(~p, {<<\"ttl-t2k\">>, 0, ~p})", [TableId, ?FDB_WC]),
     End = mfdb_lib:unixtime() - TTL,
     RangeEnd = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, End, ?FDB_END}),
-    ?dbg("Range end: mfdb_lib:encode_prefix(~p, {<<\"ttl-t2k\">>, ~p, ~p})", [TableId, End, ?FDB_END]),
     reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd).
 
 reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
@@ -90,5 +85,6 @@ reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
                                 EncKey
                         end, ok, KVs),
             ok = erlfdb:clear_range(Conn, RangeStart, erlfdb_key:strinc(LastKey)),
-            reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd)
+            %%reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd)
+            ok
     end.

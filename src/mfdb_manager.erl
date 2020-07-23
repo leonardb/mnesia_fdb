@@ -26,7 +26,8 @@
          create_table/2,
          delete_table/1,
          load_if_exists/1,
-         st/1]).
+         st/1,
+         set_ttl/2]).
 
 -export([read_info/3,
          write_info/3]).
@@ -51,7 +52,7 @@ create_table(Tab, Props) ->
 
 delete_table(Tab0) ->
     ?dbg("DELETE TABLE ~p~n", [Tab0]),
-    gen_server:call(?MODULE, {delete_table, Tab0}).
+    gen_server:call(?MODULE, {delete_table, Tab0}, infinity).
 
 load_table(Tab0, _Default) ->
     Tab = tab_name_(Tab0),
@@ -97,6 +98,44 @@ st(Tab0) ->
         _ ->
             badarg
     end.
+
+set_ttl(Tab0, TTL) when is_atom(Tab0) ->
+    Tab = tab_name_(Tab0),
+    PTabKey = <<"tbl_", Tab/binary, "_settings">>,
+    case ets:lookup(?MODULE, Tab) of
+        [#st{ttl = TTL}] ->
+            %% do nothing
+            ok;
+        [#st{db = Db, table_id = TableId, ttl = undefined} = St] when is_integer(TTL) ->
+            %% Add TTL to table
+            NSt = St#st{ttl = TTL},
+            ets:insert(?MODULE, {Tab, NSt}),
+            ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
+            ok = init_reaper(Tab0, TableId, TTL),
+            ok;
+        [#st{db = Db, table_id = TableId} = St] when TTL =:= undefined ->
+            %% remove TTL from table, including removing all
+            %% related TTL entries for existing records
+            NSt = St#st{ttl = undefined},
+            ets:insert(?MODULE, {Tab, NSt}),
+            ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
+            stop_reaper(Tab0),
+            RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, ?FDB_WC, ?FDB_WC}),
+            ok = erlfdb:clear_range_startswith(Db, RangeStart),
+            ok;
+        [#st{db = Db, table_id = TableId, ttl = OTTL} = St] when is_integer(OTTL) andalso is_integer(TTL) ->
+            %% remove TTL from table, including removing all
+            %% related TTL entries for existing records
+            NSt = St#st{ttl = undefined},
+            ets:insert(?MODULE, {Tab, NSt}),
+            ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
+            stop_reaper(Tab0),
+            ok = init_reaper(Tab0, TableId, TTL),
+            ok;
+        _ ->
+            badarg
+    end.
+
 
 write_info({Parent, index, {Pos, _}}, index_consistent, Value) ->
     ParentTab = tab_name_(Parent),
@@ -304,8 +343,6 @@ mk_tab_(Db, TableId, Tab, MTab, Props) ->
     Alias = proplists:get_value(alias, Props, fdb_copies),
     RecordName = proplists:get_value(record_name, Props, Tab),
     {attributes, Attributes} = lists:keyfind(attributes, 1, Props),
-    OnWriteError = proplists:get_value(on_write_error, Props, ?WRITE_ERR_DEFAULT),
-    OnWriteErrorStore = proplists:get_value(on_write_error_store, Props, ?WRITE_ERR_STORE_DEFAULT),
     HcaRef = erlfdb_hca:create(<<TableId/binary, "_hca_ref">>),
     IdxTuple = list_to_tuple(lists:duplicate(length(Attributes) + 1, undefined)),
     Indexes = proplists:get_value(index, Props, []),
@@ -319,8 +356,6 @@ mk_tab_(Db, TableId, Tab, MTab, Props) ->
             attributes           = Attributes,
             index                = IdxTuple,
             ttl                  = TTL,
-            on_write_error       = OnWriteError,
-            on_write_error_store = OnWriteErrorStore,
             db                   = Db,
             table_id             = TableId,
             hca_ref              = HcaRef,
