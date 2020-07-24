@@ -225,14 +225,18 @@ check_definition_entry(Tab, Id, {type, T}) ->
     mnesia:abort({combine_error, Tab, [Id, {type, T}]});
 check_definition_entry(Tab, _Id, {user_properties, UPs} = P) ->
     TTL = proplists:get_value(ttl, UPs, undefined),
-    #st{ttl = OTTL} = mfdb_manager:st(Tab),
-    case OTTL =/= TTL of
-        true ->
-            mfdb_manager:set_ttl(Tab, TTL);
-        false ->
-            ok
-    end,
-    P;
+    case mfdb_manager:st(Tab) of
+        #st{ttl = OTTL} ->
+            case OTTL =/= TTL of
+                true ->
+                    mfdb_manager:set_ttl(Tab, TTL);
+                false ->
+                    ok
+            end,
+            P;
+        _ ->
+            P
+    end;
 check_definition_entry(_Tab, _Id, P) ->
     P.
 
