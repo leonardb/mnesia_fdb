@@ -119,9 +119,9 @@ set_ttl(Tab0, TTL) when is_atom(Tab0) ->
             NSt = St#st{ttl = undefined},
             ets:insert(?MODULE, {Tab, NSt}),
             ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
-            ok = reaper_stop(Tab0),
-            RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, ?FDB_WC, ?FDB_WC}),
-            ok = erlfdb:clear_range_startswith(Db, RangeStart),
+            %% reaper shutdown removes all ttl related
+            %% records then shuts itself down
+            ok = reaper_shutdown(Tab0),
             ok;
         [#st{db = Db, table_id = TableId, ttl = OTTL} = St] when is_integer(OTTL) andalso is_integer(TTL) ->
             %% change the TTL setting in the reaper by restarting it
@@ -440,6 +440,15 @@ reaper_stop(TabName) ->
             end
     end,
     ok.
+
+reaper_shutdown(TabName) ->
+    Reaper = list_to_atom("mfdb_reaper_" ++ atom_to_list(TabName)),
+    case whereis(Reaper) of
+        undefined ->
+            ok;
+        _RPid ->
+            gen_server:cast(Reaper, shutdown)
+    end.
 
 create_index_({_, index, {Pos, _}} = Tab, Db, #st{index = Indexes0} = Parent) ->
     case element(Pos, Indexes0) of

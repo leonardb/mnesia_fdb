@@ -39,6 +39,10 @@ handle_call(stop, _From, #state{} = State) ->
 handle_call(_Request, _From, #state{} = State) ->
     {reply, ok, State}.
 
+handle_cast(shutdown, #state{conn = Conn, table_id = TableId, timer = Timer} = State) ->
+    ok = poll_cancel(Timer),
+    ok = purge_ttls(Conn, TableId),
+    {stop, normal, State};
 handle_cast(_Request, #state{} = State) ->
     {noreply, State}.
 
@@ -63,6 +67,12 @@ poll_timer(TRef) when is_reference(TRef) ->
     erlang:cancel_timer(TRef),
     erlang:send_after(?REAP_POLL_INTERVAL, self(), poll).
 
+poll_cancel(undefined) ->
+    ok;
+poll_cancel(TRef) when is_reference(TRef) ->
+    erlang:cancel_timer(TRef),
+    ok.
+
 reap_expired(Conn, TableName, TableId, TTL) ->
     RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, 0, ?FDB_WC}),
     End = mfdb_lib:unixtime() - TTL,
@@ -85,6 +95,25 @@ reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
                                 EncKey
                         end, ok, KVs),
             ok = erlfdb:clear_range(Conn, RangeStart, erlfdb_key:strinc(LastKey)),
-            %%reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd)
             ok
+    end.
+
+purge_ttls(Conn, TableId) ->
+    RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, 0, ?FDB_WC}),
+    purge_ttls_(Conn, TableId, RangeStart).
+
+purge_ttls_(Conn, TableId, RangeStart) ->
+    case erlfdb:get_range_startswith(Conn, RangeStart, [{limit, 1000}]) of
+        [] ->
+            ok;
+        KVs ->
+            LastKey = lists:foldl(
+                        fun({EncKey, <<>>}, _) ->
+                                RKey = mfdb_lib:decode_key(TableId, EncKey),
+                                TtlK2T = mfdb_lib:encode_key(TableId, {<<"ttl-k2t">>, RKey}),
+                                ok = erlfdb:clear(Conn, TtlK2T),
+                                EncKey
+                        end, ok, KVs),
+            ok = erlfdb:clear_range(Conn, RangeStart, erlfdb_key:strinc(LastKey)),
+            purge_ttls_(Conn, TableId, RangeStart)
     end.
