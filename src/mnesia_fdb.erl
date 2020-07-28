@@ -394,7 +394,12 @@ delete(Alias, Tab, Key) ->
     ?dbg("~p delete(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
     case mfdb_manager:st(Tab) of
         #st{} = St ->
-            do_delete(Key, St);
+            try db_delete(St, Key)
+        catch
+                E:M ->
+                    io:format("Delete error ~p ~p", [E,M]),
+                    badarg
+            end;
         _ ->
             ok
     end.
@@ -412,7 +417,12 @@ insert(_Alias, Tab0, Obj) ->
     Pos = keypos(Tab0),
     Key = element(Pos, Obj),
     Val = setelement(Pos, Obj, []),
-    do_insert(Key, Val, St).
+    try mfdb_lib:put(St, Key, Val)
+    catch
+        E:M ->
+            io:format("Insert error: ~p ~p~n", [E,M]),
+            badarg
+    end.
 
 %% Since the key is replaced with [] in the record, we have to put it back
 %% into the found record.
@@ -853,9 +863,8 @@ update_counter(Alias, Tab, Key, Incr) when is_integer(Incr) ->
 
 %% server-side part
 do_update_counter(Key, Incr, #st{db = Db, table_id = TableId}) when is_integer(Incr) ->
-    EncKey = mfdb_lib:encode_key(TableId, {<<"c">>, Key}),
     Tx = erlfdb:create_transaction(Db),
-    {ok, NewVal} = mfdb_lib:update_counter(Tx, EncKey, Incr),
+    {ok, NewVal} = mfdb_lib:update_counter(Tx, TableId, Key, Incr),
     erlfdb:wait(erlfdb:commit(Tx)),
     NewVal.
 
@@ -922,14 +931,7 @@ tmp_suffixes() ->
     ?dbg("~p : tmp_suffixes()", [self()]),
     [].
 
-
-%% server-side end of insert/3.
-do_insert(K, V, #st{} = St) ->
-    return_catch(fun() -> db_put(St, K, V) end).
-
 %% server-side part
-do_delete(Key, #st{} = St) ->
-    return_catch(fun() -> db_delete(St, Key) end).
 
 do_match_delete(Pat, #st{table_id = TableId, mtab = MTab} = St) ->
     MS = [{Pat,[],['$_']}],

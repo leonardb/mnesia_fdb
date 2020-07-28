@@ -1,7 +1,7 @@
 {"1.1.0",
 [{<<"erlfdb">>,
   {git,"https://github.com/leonardb/couchdb-erlfdb.git",
-       {ref,"6a84378bd8637b58150c95b1905fd7257618f8dd"}},
+       {ref,"c74a4b7447a0ff58a28aee2322be43002cd154d1"}},
   0},
  {<<"sext">>,{pkg,<<"sext">>,<<"1.6.0">>},0}]}.
 [
