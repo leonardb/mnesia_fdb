@@ -36,14 +36,12 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, ttl
     Fun = fun(Tx) ->
                   SizeInc = case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
                                 <<"mfdb_ref", OldSize:32, OldMfdbRefPartId/binary>> ->
-                                    io:format("duplicate key: ~p~n", [K]),
                                     %% Replacing entry, increment by size diff
                                     {<<"p">>, PartHcaVal} = sext:decode(OldMfdbRefPartId),
                                     Start = encode_prefix(TableId, {<<"p">>, PartHcaVal, <<"_">>, '_'}),
                                     ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, Start)),
                                     ((OldSize * -1) + Size);
                                 <<OldSize:32, _/binary>> ->
-                                    io:format("duplicate key: ~p~n", [K]),
                                     %% Replacing entry, increment by size diff
                                     ((OldSize * -1) + Size);
                                 not_found ->
