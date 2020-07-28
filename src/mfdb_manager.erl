@@ -26,7 +26,8 @@
          create_table/2,
          delete_table/1,
          load_if_exists/1,
-         st/1]).
+         st/1,
+         set_ttl/2]).
 
 -export([read_info/3,
          write_info/3]).
@@ -51,13 +52,14 @@ create_table(Tab, Props) ->
 
 delete_table(Tab0) ->
     ?dbg("DELETE TABLE ~p~n", [Tab0]),
-    gen_server:call(?MODULE, {delete_table, Tab0}).
+    gen_server:call(?MODULE, {delete_table, Tab0}, infinity).
 
 load_table(Tab0, _Default) ->
     Tab = tab_name_(Tab0),
     ?dbg("LOOKUP TABLE ~p~n", [Tab0]),
     try ets:lookup(?MODULE, Tab) of
-        [#st{tab = Tab, info = Infos} = Rec] ->
+        [#st{table_id = TableId, tab = Tab, info = Infos, ttl = TTL} = Rec] ->
+            ok = reaper_start(Tab0, TableId, TTL),
             write_ets_infos_(Infos),
             Rec;
         [] ->
@@ -69,7 +71,8 @@ load_table(Tab0, _Default) ->
 load_if_exists(Tab0) ->
     Tab = tab_name_(Tab0),
     try ets:lookup(?MODULE, Tab) of
-        [#st{tab = Tab, info = Infos}] ->
+        [#st{table_id = TableId, tab = Tab, info = Infos, ttl = TTL}] ->
+            ok = reaper_start(Tab0, TableId, TTL),
             write_ets_infos_(Infos),
             ok;
         [] ->
@@ -95,6 +98,43 @@ st(Tab0) ->
         _ ->
             badarg
     end.
+
+set_ttl(Tab0, TTL) when is_atom(Tab0) ->
+    Tab = tab_name_(Tab0),
+    PTabKey = <<"tbl_", Tab/binary, "_settings">>,
+    case ets:lookup(?MODULE, Tab) of
+        [#st{ttl = TTL}] ->
+            %% do nothing, TTL has not changed
+            ok;
+        [#st{db = Db, table_id = TableId, ttl = undefined} = St] when is_integer(TTL) ->
+            %% Add TTL to table and start the reaper
+            NSt = St#st{ttl = TTL},
+            ets:insert(?MODULE, {Tab, NSt}),
+            ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
+            ok = reaper_start(Tab0, TableId, TTL),
+            ok;
+        [#st{db = Db, table_id = TableId} = St] when TTL =:= undefined ->
+            %% remove TTL from table, including removing all
+            %% related TTL entries for existing records
+            NSt = St#st{ttl = undefined},
+            ets:insert(?MODULE, {Tab, NSt}),
+            ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
+            %% reaper shutdown removes all ttl related
+            %% records then shuts itself down
+            ok = reaper_shutdown(Tab0),
+            ok;
+        [#st{db = Db, table_id = TableId, ttl = OTTL} = St] when is_integer(OTTL) andalso is_integer(TTL) ->
+            %% change the TTL setting in the reaper by restarting it
+            NSt = St#st{ttl = undefined},
+            ets:insert(?MODULE, {Tab, NSt}),
+            ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
+            ok = reaper_stop(Tab0),
+            ok = reaper_start(Tab0, TableId, TTL),
+            ok;
+        _ ->
+            badarg
+    end.
+
 
 write_info({Parent, index, {Pos, _}}, index_consistent, Value) ->
     ParentTab = tab_name_(Parent),
@@ -269,14 +309,15 @@ delete_table_({Parent0, index, {Pos, _}}) ->
 delete_table_(Tab0) ->
     Tab = tab_name_(Tab0),
     Db = db_conn_(),
+    reaper_stop(Tab0),
     [#st{index = Indexes0, table_id = TableId}] = ets:lookup(?MODULE, Tab),
     %% Remove indexes
     [clear_index(Db, IdxTabId) || #idx{table_id = IdxTabId} <- tuple_to_list(Indexes0)],
     ok = clear_table(Db, TableId),
     ok = erlfdb:clear(Db, <<"tbl_", Tab/binary>>),
     ok = erlfdb:clear(Db, <<"tbl_", Tab/binary, "_settings">>),
-    ets:select_delete(?MODULE, [{#info{k = {Tab, '_'}, _ = '_'}, [], [true]}]),
-    ets:select_delete(?MODULE, [{#info{k = {Tab, '_', '_'}, _ = '_'}, [], [true]}]),
+    ets:select_delete(?MODULE, [{#info{k = {Tab, ?FDB_WC}, _ = '_'}, [], [true]}]),
+    ets:select_delete(?MODULE, [{#info{k = {Tab, ?FDB_WC, ?FDB_WC}, _ = '_'}, [], [true]}]),
     ets:delete(?MODULE, Tab),
     ok.
 
@@ -292,20 +333,20 @@ clear_index(Db, TableId) ->
 clear_table(Db, TableId) ->
     ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"c">>})),
     ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"s">>})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_', '_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_', '_'})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {'_'})).
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC, ?FDB_WC, ?FDB_WC})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC, ?FDB_WC})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC})).
 
 mk_tab_(Db, TableId, Tab, MTab, Props) ->
     Alias = proplists:get_value(alias, Props, fdb_copies),
     RecordName = proplists:get_value(record_name, Props, Tab),
     {attributes, Attributes} = lists:keyfind(attributes, 1, Props),
-    OnWriteError = proplists:get_value(on_write_error, Props, ?WRITE_ERR_DEFAULT),
-    OnWriteErrorStore = proplists:get_value(on_write_error_store, Props, ?WRITE_ERR_STORE_DEFAULT),
     HcaRef = erlfdb_hca:create(<<TableId/binary, "_hca_ref">>),
     IdxTuple = list_to_tuple(lists:duplicate(length(Attributes) + 1, undefined)),
     Indexes = proplists:get_value(index, Props, []),
+    UserProperties = proplists:get_value(user_properties, Props, []),
+    TTL = proplists:get_value(ttl, UserProperties, undefined),
     St = #st{
             tab                  = Tab,
             mtab                 = MTab,
@@ -313,8 +354,7 @@ mk_tab_(Db, TableId, Tab, MTab, Props) ->
             record_name          = RecordName,
             attributes           = Attributes,
             index                = IdxTuple,
-            on_write_error       = OnWriteError,
-            on_write_error_store = OnWriteErrorStore,
+            ttl                  = TTL,
             db                   = Db,
             table_id             = TableId,
             hca_ref              = HcaRef,
@@ -370,13 +410,44 @@ create_table_(Tab0, Props) when is_atom(Tab0) ->
             Hca = erlfdb_hca:create(<<"hca_table">>),
             TableId0 = erlfdb_hca:allocate(Hca, Db),
             ?dbg("MAKE TABLE ~p~n", [Tab]),
-            #st{info = Infos} = Table0 = mk_tab_(Db, TableId0, Tab, Tab0, Props),
+            #st{info = Infos, ttl = TTL} = Table0 = mk_tab_(Db, TableId0, Tab, Tab0, Props),
             ok = erlfdb:set(Db, TabKey, term_to_binary(Table0)),
             true = ets:insert(?MODULE, Table0),
             write_ets_infos_(Infos),
+            ok = reaper_start(Tab0, TableId0, TTL),
             ok;
         ok ->
             ok
+    end.
+
+reaper_start(_TabName, _TableId, undefined) ->
+    ok;
+reaper_start(TabName, TableId, TTL) ->
+    mfdb_reaper_sup:add_reaper(TabName, TableId, TTL).
+
+reaper_stop(TabName) ->
+    Reaper = list_to_atom("mfdb_reaper_" ++ atom_to_list(TabName)),
+    case whereis(Reaper) of
+        undefined ->
+            ok;
+        _RPid ->
+            try gen_server:call(Reaper, stop, infinity) of
+                ok ->
+                 supervisor:delete_child(mfdb_reaper_sup, Reaper)
+            catch
+                _:_ ->
+                    ok
+            end
+    end,
+    ok.
+
+reaper_shutdown(TabName) ->
+    Reaper = list_to_atom("mfdb_reaper_" ++ atom_to_list(TabName)),
+    case whereis(Reaper) of
+        undefined ->
+            ok;
+        _RPid ->
+            gen_server:cast(Reaper, shutdown)
     end.
 
 create_index_({_, index, {Pos, _}} = Tab, Db, #st{index = Indexes0} = Parent) ->
@@ -406,11 +477,12 @@ load_table_(Tab0) ->
         not_found ->
             {error, not_found};
         Table0 ->
-            #st{info = Infos} = Table1 = binary_to_term(Table0),
+            #st{table_id = TableId, ttl = TTL, info = Infos} = Table1 = binary_to_term(Table0),
             Table2 = Table1#st{db = Db},
             ok = erlfdb:set(Db, TabKey, term_to_binary(Table2)),
             true = ets:insert(?MODULE, Table2),
             write_ets_infos_(Infos),
+            reaper_start(Tab0, TableId, TTL),
             ok
     end.
 

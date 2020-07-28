@@ -223,22 +223,19 @@ check_definition_entry(Tab, Id, {type, T}) ->
     ?dbg("~p: check_definition_entry(~p, ~p, ~p);~n Trace: ~s~n",
          [self(), Tab, Id, {type, T}, pp_stack()]),
     mnesia:abort({combine_error, Tab, [Id, {type, T}]});
-check_definition_entry(_Tab, _Id, {user_properties, UPs} = P) ->
-    FdbOpts = proplists:get_value(fdb_opts, UPs, []),
-    OWE = proplists:get_value(on_write_error, FdbOpts, ?WRITE_ERR_DEFAULT),
-    OWEStore = proplists:get_value(on_write_error_store, FdbOpts, ?WRITE_ERR_STORE_DEFAULT),
-    case valid_mnesia_op(OWE) of
-        true ->
-            case OWEStore of
-                undefined ->
-                    P;
-                V when is_atom(V) ->
-                    P;
-                V ->
-                    throw({error, {invalid_configuration, {on_write_error_store, V}}})
-            end;
-        false ->
-            throw({error, {invalid_configuration, {on_write_error, OWE}}})
+check_definition_entry(Tab, _Id, {user_properties, UPs} = P) ->
+    TTL = proplists:get_value(ttl, UPs, undefined),
+    case mfdb_manager:st(Tab) of
+        #st{ttl = OTTL} ->
+            case OTTL =/= TTL of
+                true ->
+                    mfdb_manager:set_ttl(Tab, TTL);
+                false ->
+                    ok
+            end,
+            P;
+        _ ->
+            P
     end;
 check_definition_entry(_Tab, _Id, P) ->
     P.
@@ -251,7 +248,7 @@ load_table(_Alias, Tab, restore, Props) ->
     mfdb_manager:create_table(Tab, Props);
 load_table(_Alias, Tab, LoadReason, Opts) ->
     ?dbg("~p :: load_table(~p, ~p, ~p, ~p)", [self(), _Alias, Tab, LoadReason, Opts]),
-    case mfdb_manager:st(Tab) of
+    case mfdb_manager:load_table(Tab, Opts) of
         #st{} ->
             ok;
         _ ->
@@ -395,8 +392,17 @@ chunk_fun() ->
 
 delete(Alias, Tab, Key) ->
     ?dbg("~p delete(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
-    #st{} = St = mfdb_manager:st(Tab),
-    do_delete(Key, St).
+    case mfdb_manager:st(Tab) of
+        #st{} = St ->
+            try db_delete(St, Key)
+        catch
+                E:M ->
+                    io:format("Delete error ~p ~p", [E,M]),
+                    badarg
+            end;
+        _ ->
+            ok
+    end.
 
 %% Not relevant for an ordered_set
 fixtable(_Alias, _Tab, _Bool) ->
@@ -411,7 +417,12 @@ insert(_Alias, Tab0, Obj) ->
     Pos = keypos(Tab0),
     Key = element(Pos, Obj),
     Val = setelement(Pos, Obj, []),
-    do_insert(Key, Val, St).
+    try mfdb_lib:put(St, Key, Val)
+    catch
+        E:M ->
+            io:format("Insert error: ~p ~p~n", [E,M]),
+            badarg
+    end.
 
 %% Since the key is replaced with [] in the record, we have to put it back
 %% into the found record.
@@ -852,9 +863,8 @@ update_counter(Alias, Tab, Key, Incr) when is_integer(Incr) ->
 
 %% server-side part
 do_update_counter(Key, Incr, #st{db = Db, table_id = TableId}) when is_integer(Incr) ->
-    EncKey = mfdb_lib:encode_key(TableId, {<<"c">>, Key}),
     Tx = erlfdb:create_transaction(Db),
-    {ok, NewVal} = mfdb_lib:update_counter(Tx, EncKey, Incr),
+    {ok, NewVal} = mfdb_lib:update_counter(Tx, TableId, Key, Incr),
     erlfdb:wait(erlfdb:commit(Tx)),
     NewVal.
 
@@ -921,14 +931,7 @@ tmp_suffixes() ->
     ?dbg("~p : tmp_suffixes()", [self()]),
     [].
 
-
-%% server-side end of insert/3.
-do_insert(K, V, #st{} = St) ->
-    return_catch(fun() -> db_put(St, K, V) end).
-
 %% server-side part
-do_delete(Key, #st{} = St) ->
-    return_catch(fun() -> db_delete(St, Key) end).
 
 do_match_delete(Pat, #st{table_id = TableId, mtab = MTab} = St) ->
     MS = [{Pat,[],['$_']}],
@@ -1302,67 +1305,11 @@ return_catch(F) when is_function(F, 0) ->
             badarg
     end.
 
-db_delete(#st{db = Db} = St, K) ->
-    Res = mfdb_lib:delete(St, K),
-    write_result(Res, delete, [Db, K], St).
+db_delete(#st{} = St, K) ->
+    mfdb_lib:delete(St, K).
 
-db_put(#st{db = Db} = St, K, V) ->
-    Res = mfdb_lib:put(St, K, V),
-    write_result(Res, put, [Db, K, V], St).
-
-write_result(ok, _, _, _) ->
-    ok;
-write_result(Res, Op, Args, #st{tab = Tab, table_id = TableId, on_write_error = Rpt, on_write_error_store = OWEStore}) ->
-    RptOp = rpt_op(Rpt),
-    maybe_store_error(OWEStore, TableId, Res, Tab, Op, Args, erlang:system_time(millisecond)),
-    mnesia_lib:RptOp("FAILED mfdb_lib:~p(" ++ rpt_fmt(Args) ++ ") -> ~p~n",
-                     [Op | Args] ++ [Res]),
-    %%    ?dbg("FAILED mfdb_lib:~p(" ++ rpt_fmt(Args) ++ ") -> ~p~n",
-    %%         [Op | Args] ++ [Res]),
-    if Rpt == fatal; Rpt == error ->
-            throw(badarg);
-       true ->
-            ok
-    end.
-
-maybe_store_error(undefined, _, _, _, _, _, _) ->
-    ok;
-maybe_store_error(Table, TableId, Err, IntTable, put, [_, K, _, _], Time) ->
-    insert_error(Table, TableId, IntTable, K, Err, Time);
-maybe_store_error(Table, TableId, Err, IntTable, delete, [_, K, _], Time) ->
-    insert_error(Table, TableId, IntTable, K, Err, Time);
-maybe_store_error(Table, TableId, Err, IntTable, write, [_, List, _], Time) ->
-    lists:map(fun
-                  ({put, K, _}) ->
-                     insert_error(Table, TableId, IntTable, K, Err, Time);
-                  ({delete, K}) ->
-                     insert_error(Table, TableId, IntTable, K, Err, Time)
-             end, List).
-
-insert_error(Table, TableId, {Type, _, _}, K, Err, Time) ->
-    K1 = mfdb_lib:decode_key(TableId, K),
-    ets:insert(Table, {{Type, K1}, Err, Time});
-insert_error(Table, _TableId, Type, K, Err, Time) when is_atom(Type) ->
-    ets:insert(Table, {{Type, K}, Err, Time}).
-
-rpt_fmt([_|T]) ->
-    lists:append(["~p" | [", ~p" || _ <- T]]).
-
-rpt_op(debug) ->
-    dbg_out;
-rpt_op(Op) ->
-    Op.
-
-valid_mnesia_op(Op) ->
-    if Op==debug
-       ; Op==verbose
-       ; Op==warning
-       ; Op==error
-       ; Op==fatal ->
-            true;
-       true ->
-            false
-    end.
+db_put(#st{} = St, K, V) ->
+    mfdb_lib:put(St, K, V).
 
 %% ----------------------------------------------------------------------------
 %% COMMON PRIVATE

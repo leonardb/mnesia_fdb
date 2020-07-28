@@ -41,4 +41,9 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    {ok, { {one_for_one, 5, 10}, [?CHILD(mfdb_manager, worker)]} }.
+    Manager = ?CHILD(mfdb_manager, worker),
+    ReaperSup = {mfdb_reaper_sup,
+                 {mfdb_reaper_sup, start_link, []},
+                 permanent, 5000, supervisor,
+                 [mfdb_reaper_sup]},
+    {ok, { {one_for_one, 5, 10}, [ReaperSup, Manager]} }.
