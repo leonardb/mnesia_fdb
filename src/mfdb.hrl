@@ -29,7 +29,19 @@
 -define(TABLE_PREFIX, <<"tbl_">>).
 -define(FDB_WC, '_').
 -define(FDB_END, <<"~">>).
--define(DATA_PREFIX, <<"d">>).
+-define(DATA_PFX, <<"d">>).
+-define(DATA_INDEX_PFX, <<"di">>).
+-define(DATA_PART_PFX, <<"p">>).
+-define(DATA_REF_PFX, <<"mfdb_ref">>).
+
+-define(TABLE_COUNT_PFX, <<"c">>).
+-define(TABLE_SIZE_PFX, <<"s">>).
+-define(INDEX_COUNT_PFX, <<"i">>).
+
+-define(TTL_TO_KEY_PFX, <<"ttl-t2k">>).
+-define(KEY_TO_TTL_PFX, <<"ttl-k2t">>).
+
+
 -define(IS_DB, {erlfdb_database, _}).
 -define(IS_TX, {erlfdb_transaction, _}).
 -define(IS_FUTURE, {erlfdb_future, _, _}).

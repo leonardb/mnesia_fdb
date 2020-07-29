@@ -74,9 +74,9 @@ poll_cancel(TRef) when is_reference(TRef) ->
     ok.
 
 reap_expired(Conn, TableName, TableId, TTL) ->
-    RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, 0, ?FDB_WC}),
+    RangeStart = mfdb_lib:encode_prefix(TableId, {?TTL_TO_KEY_PFX, 0, ?FDB_WC}),
     End = mfdb_lib:unixtime() - TTL,
-    RangeEnd = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, End, ?FDB_END}),
+    RangeEnd = mfdb_lib:encode_prefix(TableId, {?TTL_TO_KEY_PFX, End, ?FDB_WC}),
     reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd).
 
 reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
@@ -90,7 +90,7 @@ reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
                                 ?dbg("Delete ~p from ~p", [RKey, TableName]),
                                 ok = mnesia:dirty_delete(TableName, RKey),
                                 %% Key2Ttl have to be removed individually
-                                TtlK2T = mfdb_lib:encode_key(TableId, {<<"ttl-k2t">>, RKey}),
+                                TtlK2T = mfdb_lib:encode_key(TableId, {?KEY_TO_TTL_PFX, RKey}),
                                 ok = erlfdb:clear(Conn, TtlK2T),
                                 EncKey
                         end, ok, KVs),
@@ -99,7 +99,7 @@ reap_expired_(Conn, TableName, TableId, RangeStart, RangeEnd) ->
     end.
 
 purge_ttls(Conn, TableId) ->
-    RangeStart = mfdb_lib:encode_prefix(TableId, {<<"ttl-t2k">>, 0, ?FDB_WC}),
+    RangeStart = mfdb_lib:encode_prefix(TableId, {?TTL_TO_KEY_PFX, 0, ?FDB_WC}),
     purge_ttls_(Conn, TableId, RangeStart).
 
 purge_ttls_(Conn, TableId, RangeStart) ->
@@ -110,7 +110,7 @@ purge_ttls_(Conn, TableId, RangeStart) ->
             LastKey = lists:foldl(
                         fun({EncKey, <<>>}, _) ->
                                 RKey = mfdb_lib:decode_key(TableId, EncKey),
-                                TtlK2T = mfdb_lib:encode_key(TableId, {<<"ttl-k2t">>, RKey}),
+                                TtlK2T = mfdb_lib:encode_key(TableId, {?KEY_TO_TTL_PFX, RKey}),
                                 ok = erlfdb:clear(Conn, TtlK2T),
                                 EncKey
                         end, ok, KVs),

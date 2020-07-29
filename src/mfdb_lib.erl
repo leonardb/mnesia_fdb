@@ -27,7 +27,7 @@
 put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, ttl = TTL}, K, V0) when is_atom(MTab) ->
     %% Operation is on a data table
     ?dbg("Data insert: ~p", [{K, V0}]),
-    EncKey = encode_key(TableId, {<<"d">>, K}),
+    EncKey = encode_key(TableId, {?DATA_PFX, K}),
     V1 = term_to_binary(V0),
     Size = byte_size(V1),
     %% Add size header as first 32-bits of value
@@ -35,10 +35,10 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, ttl
     %%Tx = erlfdb:create_transaction(Db),
     Fun = fun(Tx) ->
                   SizeInc = case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
-                                <<"mfdb_ref", OldSize:32, OldMfdbRefPartId/binary>> ->
+                                <<"mfdb_ref", OldSize:32/integer, OldMfdbRefPartId/binary>> ->
                                     %% Replacing entry, increment by size diff
-                                    {<<"p">>, PartHcaVal} = sext:decode(OldMfdbRefPartId),
-                                    Start = encode_prefix(TableId, {<<"p">>, PartHcaVal, <<"_">>, '_'}),
+                                    {?DATA_PART_PFX, PartHcaVal} = erlfdb_tuple:unpack(OldMfdbRefPartId),
+                                    Start = encode_prefix(TableId, {?DATA_PART_PFX, PartHcaVal, <<"_">>, '_'}),
                                     ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, Start)),
                                     ((OldSize * -1) + Size);
                                 <<OldSize:32, _/binary>> ->
@@ -54,7 +54,7 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, ttl
                       true ->
                           %% Save the new parts
                           MfdbRefPartId = save_parts(Tx, TableId, HcaRef, V),
-                          ok = erlfdb:wait(erlfdb:set(Tx, EncKey, <<"mfdb_ref", Size:32, MfdbRefPartId/binary>>));
+                          ok = erlfdb:wait(erlfdb:set(Tx, EncKey, <<?DATA_REF_PFX/binary, Size:32, MfdbRefPartId/binary>>));
                       false ->
                           erlfdb:wait(erlfdb:set(Tx, EncKey, V))
                   end,
@@ -83,38 +83,38 @@ put_ttl(Tx, TableId, TTL, Key) ->
     %% and we also need to remove the previous entry if a record gets updated
     ttl_remove_(Tx, TableId, TTL, Key),
     Now = unixtime(),
-    ?dbg("Adding TTL Keys: ~p and ~p", [{<<"ttl-t2k">>, Now, Key}, {<<"ttl-k2t">>, Key}]),
-    erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {<<"ttl-t2k">>, Now, Key}), <<>>)),
-    erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {<<"ttl-k2t">>, Key}), integer_to_binary(Now, 10))).
+    ?dbg("Adding TTL Keys: ~p and ~p", [{?TTL_TO_KEY_PFX, Now, Key}, {?KEY_TO_TTL_PFX, Key}]),
+    erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {?TTL_TO_KEY_PFX, Now, Key}), <<>>)),
+    erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {?KEY_TO_TTL_PFX, Key}), integer_to_binary(Now, 10))).
 
 ttl_remove_(_Tx, _TableId, undefined, _Key) ->
     ok;
 ttl_remove_(Tx, TableId, _TTL, Key) ->
     ?dbg("Removing TTL refs: ~p ~p", [TableId, Key]),
-    TtlK2T = encode_key(TableId, {<<"ttl-k2t">>, Key}),
+    TtlK2T = encode_key(TableId, {?KEY_TO_TTL_PFX, Key}),
     case erlfdb:wait(erlfdb:get(Tx, TtlK2T)) of
         not_found ->
             ok;
         Added ->
-            OldTtlT2K = {<<"ttl-t2k">>, binary_to_integer(Added, 10), Key},
+            OldTtlT2K = {?TTL_TO_KEY_PFX, binary_to_integer(Added, 10), Key},
             erlfdb:wait(erlfdb:clear(Tx, encode_key(TableId, OldTtlT2K)))
 
     end,
-    erlfdb:wait(erlfdb:clear(Tx, encode_key(TableId, {<<"ttl-k2t">>, Key}))).
+    erlfdb:wait(erlfdb:clear(Tx, encode_key(TableId, {?KEY_TO_TTL_PFX, Key}))).
 
 add_data_indexes_(Tx, K, Val, #idx{table_id = TableId}) ->
     ok = idx_count_inc(Tx, TableId, Val, 1),
-    ?dbg("Add data index ~p", [{<<"di">>, {Val, K}}]),
-    ok = erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {<<"di">>, {Val, K}}), <<>>)).
+    ?dbg("Add data index ~p", [{?DATA_INDEX_PFX, {Val, K}}]),
+    ok = erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {?DATA_INDEX_PFX, {Val, K}}), <<>>)).
 
 remove_data_indexes_(Tx, Val, Key, #idx{table_id = TableId}) ->
     ok = idx_count_inc(Tx, TableId, Val, -1),
-    ?dbg("Remove data index ~p", [{<<"di">>, {Val, Key}}]),
-    ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, encode_prefix(TableId, {<<"di">>, {Val, Key}}))).
+    ?dbg("Remove data index ~p", [{?DATA_INDEX_PFX, {Val, Key}}]),
+    ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, encode_prefix(TableId, {?DATA_INDEX_PFX, {Val, Key}}))).
 
 parts_value_(MfdbRefPartId, TableId, Tx) ->
-    {<<"p">>, PartHcaVal} = sext:decode(MfdbRefPartId),
-    Start = encode_prefix(TableId, {<<"p">>, PartHcaVal, <<"_">>, '_'}),
+    {?DATA_PART_PFX, PartHcaVal} = erlfdb_tuple:unpack(MfdbRefPartId),
+    Start = encode_prefix(TableId, {?DATA_PART_PFX, PartHcaVal, <<"_">>, '_'}),
     Parts = erlfdb:wait(erlfdb:get_range_startswith(Tx, Start)),
     bin_join_parts(Parts).
 
@@ -138,7 +138,7 @@ delete(#st{db = ?IS_TX = Tx, table_id = TableId, ttl = TTL}, K) ->
     do_delete_data_(Tx, TableId, false, TTL, K).
 
 do_delete_data_(Tx, TableId, DoCommit, TTL, K) ->
-    EncKey = encode_key(TableId, {<<"d">>, K}),
+    EncKey = encode_key(TableId, {?DATA_PFX, K}),
     case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
         not_found ->
             ok;
@@ -146,8 +146,8 @@ do_delete_data_(Tx, TableId, DoCommit, TTL, K) ->
             %% decrement size
             ok = tbl_size_inc(Tx, TableId, OldSize * -1),
             %% Remove parts of large value
-            {<<"p">>, PartHcaVal} = sext:decode(MfdbRefPartId),
-            Start = encode_prefix(TableId, {<<"p">>, PartHcaVal, <<"_">>, '_'}),
+            {?DATA_PART_PFX, PartHcaVal} = erlfdb_tuple:unpack(MfdbRefPartId),
+            Start = encode_prefix(TableId, {?DATA_PART_PFX, PartHcaVal, <<"_">>, '_'}),
             ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, Start)),
             %% decrement item count
             ok = tbl_count_inc(Tx, TableId, -1);
@@ -168,7 +168,7 @@ do_delete_data_(Tx, TableId, DoCommit, TTL, K) ->
 
 idx_matches(#st{db = DbOrTx, index = Indexes}, IdxPos, Key0) ->
     #idx{table_id = TableId} = element(IdxPos, Indexes),
-    Pfx = encode_prefix(TableId, {<<"i">>, Key0, ?FDB_WC}),
+    Pfx = encode_prefix(TableId, {?INDEX_COUNT_PFX, Key0, ?FDB_WC}),
     R = case DbOrTx of
             ?IS_DB ->
                 erlfdb:get_range_startswith(DbOrTx, Pfx);
@@ -183,7 +183,7 @@ idx_matches(#st{db = DbOrTx, index = Indexes}, IdxPos, Key0) ->
     end.
 
 table_data_size(#st{db = DbOrTx, table_id = TableId}) ->
-    Pfx = encode_prefix(TableId, {<<"s">>, ?FDB_WC}),
+    Pfx = encode_prefix(TableId, {?TABLE_SIZE_PFX, ?FDB_WC}),
     R = case DbOrTx of
             ?IS_DB ->
                 erlfdb:get_range_startswith(DbOrTx, Pfx);
@@ -199,7 +199,7 @@ table_data_size(#st{db = DbOrTx, table_id = TableId}) ->
     end.
 
 table_count(#st{db = DbOrTx, table_id = TableId}) ->
-    Pfx = encode_prefix(TableId, {<<"c">>, ?FDB_WC}),
+    Pfx = encode_prefix(TableId, {?TABLE_COUNT_PFX, ?FDB_WC}),
     R = case DbOrTx of
             ?IS_DB ->
                 erlfdb:get_range_startswith(DbOrTx, Pfx);
@@ -231,21 +231,20 @@ bin_join_parts_([], Acc) ->
 bin_join_parts_([{_, Bin} | Rest], Acc) ->
     bin_join_parts_(Rest, <<Acc/binary, Bin/binary>>).
 
-decode_key(TableId, <<S:8, R/binary>>) ->
-    <<TableId:S/bits, Bin/binary>> = R,
-    case sext:decode(Bin) of
-        {<<"di">>, {Val, Id}} ->
+decode_key(TableId, EncKey) ->
+    case erlfdb_tuple:unpack(EncKey, TableId) of
+        {?DATA_INDEX_PFX, {Val, Id}} ->
             %% data index reference key
             {idx, {{Val, Id}}};
-        {<<"d">>, Key} ->
+        {?DATA_PFX, Key} ->
             Key;
-        {<<"i">>, Key} ->
+        {?INDEX_COUNT_PFX, Key} ->
             {cnt_idx, Key};
-        {<<"p">>, PartHcaVal} ->
+        {?DATA_PART_PFX, PartHcaVal} ->
             PartHcaVal;
-        {<<"ttl-t2k">>, _, Key} ->
+        {?TTL_TO_KEY_PFX, _, Key} ->
             Key;
-        {<<"ttl-k2t">>, Key} ->
+        {?KEY_TO_TTL_PFX, Key} ->
             Key;
         BadVal ->
             exit({TableId, BadVal})
@@ -260,18 +259,29 @@ decode_val(Db, TableId, <<"mfdb_ref", _OldSize:32, MfdbRefPartId/binary>>) ->
 decode_val(_Db, _TableId, <<_:32, CodedVal/binary>>) ->
     binary_to_term(CodedVal).
 
-encode_key(TableId, Key) ->
-    <<(bit_size(TableId)):8, TableId/binary, (sext:encode(Key))/binary>>.
+encode_key(TableId, Key) when is_tuple(Key) ->
+    erlfdb_tuple:pack(Key, TableId).
 
-encode_prefix(TableId, Key) ->
-    <<(bit_size(TableId)):8, TableId/binary, (sext:prefix(Key))/binary>>.
+encode_prefix(TableId, Key0) when is_tuple(Key0) ->
+    Key = mk_prefix_(Key0),
+    erlfdb_tuple:pack(Key, TableId).
+
+mk_prefix_(Key0) when is_tuple(Key0) ->
+    mk_prefix_(tuple_to_list(Key0), []).
+
+mk_prefix_([], Acc) ->
+    list_to_tuple(lists:reverse(Acc));
+mk_prefix_(['_' | _Rest], Acc) ->
+    mk_prefix_([], Acc);
+mk_prefix_([Item | Rest], Acc) ->
+    mk_prefix_(Rest, [Item | Acc]).
 
 tbl_count_key(TableId) ->
-    encode_key(TableId, {<<"c">>, rand:uniform(?ENTRIES_PER_COUNTER)}).
+    encode_key(TableId, {?TABLE_COUNT_PFX, rand:uniform(?ENTRIES_PER_COUNTER)}).
 
 tbl_count_inc(Tx, TableId, Inc) when Inc < 1 ->
     %% decrement
-    Pfx = encode_prefix(TableId, {<<"c">>, ?FDB_WC}),
+    Pfx = encode_prefix(TableId, {?TABLE_COUNT_PFX, ?FDB_WC}),
     case erlfdb:wait(erlfdb:get_range_startswith(Tx, Pfx)) of
         [] ->
             ok;
@@ -294,24 +304,24 @@ shuffle(List) ->
     [X || {_, X} <- lists:sort([{rand:uniform(), Item} || Item <- List])].
 
 tbl_size_key(TableId) ->
-    encode_key(TableId, {<<"s">>, rand:uniform(?ENTRIES_PER_COUNTER)}).
+    encode_key(TableId, {?TABLE_SIZE_PFX, rand:uniform(?ENTRIES_PER_COUNTER)}).
 
 tbl_size_inc(Tx, TableId, Inc) when Inc < 1 ->
     %% decrement
-    Pfx = encode_prefix(TableId, {<<"s">>, ?FDB_WC}),
+    Pfx = encode_prefix(TableId, {?TABLE_SIZE_PFX, ?FDB_WC}),
     case erlfdb:wait(erlfdb:get_range_startswith(Tx, Pfx)) of
         [] ->
             ok;
         Counters0 ->
             lists:foldl(
-                fun(_, ok) ->
-                    ok;
-                    ({K, <<OldVal:64/unsigned-little-integer>>}, waiting) when (OldVal + Inc) >= 0 ->
-                        erlfdb:wait(erlfdb:add(Tx, K, Inc)),
-                        ok;
-                    (_, R) ->
-                        R
-                end, waiting, shuffle(Counters0))
+              fun(_, ok) ->
+                      ok;
+                 ({K, <<OldVal:64/unsigned-little-integer>>}, waiting) when (OldVal + Inc) >= 0 ->
+                      erlfdb:wait(erlfdb:add(Tx, K, Inc)),
+                      ok;
+                 (_, R) ->
+                      R
+              end, waiting, shuffle(Counters0))
     end;
 tbl_size_inc(Tx, TableId, Inc) ->
     %% Increment random counter
@@ -319,24 +329,24 @@ tbl_size_inc(Tx, TableId, Inc) ->
     erlfdb:wait(erlfdb:add(Tx, Key, Inc)).
 
 idx_count_key(TableId, Value) ->
-    encode_key(TableId, {<<"i">>, Value, rand:uniform(?ENTRIES_PER_COUNTER)}).
+    encode_key(TableId, {?INDEX_COUNT_PFX, Value, rand:uniform(?ENTRIES_PER_COUNTER)}).
 
 idx_count_inc(Tx, TableId, Value, Inc) when Inc < 1 ->
     %% decrement
-    Pfx = encode_prefix(TableId, {<<"i">>, Value, ?FDB_WC}),
+    Pfx = encode_prefix(TableId, {?INDEX_COUNT_PFX, Value, ?FDB_WC}),
     case erlfdb:wait(erlfdb:get_range_startswith(Tx, Pfx)) of
         [] ->
             ok;
         Counters0 ->
             lists:foldl(
-                fun(_, ok) ->
-                    ok;
-                    ({K, <<OldVal:64/unsigned-little-integer>>}, waiting) when (OldVal + Inc) >= 0 ->
-                        erlfdb:wait(erlfdb:add(Tx, K, Inc)),
-                        ok;
-                    (_, R) ->
-                        R
-                end, waiting, shuffle(Counters0))
+              fun(_, ok) ->
+                      ok;
+                 ({K, <<OldVal:64/unsigned-little-integer>>}, waiting) when (OldVal + Inc) >= 0 ->
+                      erlfdb:wait(erlfdb:add(Tx, K, Inc)),
+                      ok;
+                 (_, R) ->
+                      R
+              end, waiting, shuffle(Counters0))
     end;
 idx_count_inc(Tx, TableId, Value, Inc) ->
     %% Increment random counter
@@ -345,18 +355,18 @@ idx_count_inc(Tx, TableId, Value, Inc) ->
 
 save_parts(?IS_TX = Tx, TableId, Hca, Bin) ->
     PartId = erlfdb_hca:allocate(Hca, Tx),
-    PartKey = sext:encode({<<"p">>, PartId}),
+    PartKey = erlfdb_tuple:pack({?DATA_PART_PFX, PartId}),
     ok = save_parts_(Tx, TableId, PartId, 0, Bin),
     PartKey.
 
 save_parts_(_Tx, _TableId, _PartId, _PartInc, <<>>) ->
     ok;
 save_parts_(Tx, TableId, PartId, PartInc, <<Part:?MAX_VALUE_SIZE/binary, Rest/binary>>) ->
-    Key = encode_key(TableId, {<<"p">>, PartId, <<"_">>, PartInc}),
+    Key = encode_key(TableId, {?DATA_PART_PFX, PartId, <<"_">>, PartInc}),
     ok = erlfdb:wait(erlfdb:set(Tx, Key, Part)),
     save_parts_(Tx, TableId, PartId, PartInc + 1, Rest);
 save_parts_(Tx, TableId, PartId, PartInc, Tail) ->
-    Key = encode_key(TableId, {<<"p">>, PartId, <<"_">>, PartInc}),
+    Key = encode_key(TableId, {?DATA_PART_PFX, PartId, <<"_">>, PartInc}),
     ok = erlfdb:wait(erlfdb:set(Tx, Key, Tail)),
     save_parts_(Tx, TableId, PartId, PartInc + 1, <<>>).
 
@@ -394,7 +404,7 @@ update_counter(Tx, TableId, Key, Incr) ->
     do_update_counter(Tx, TableId, Key, Incr).
 
 do_update_counter(Tx, TableId, Key, Inc) when Inc < 1 ->
-    Pfx = encode_prefix(TableId,  {<<"c">>, Key, ?FDB_WC}),
+    Pfx = encode_prefix(TableId,  {?TABLE_COUNT_PFX, Key, ?FDB_WC}),
     case erlfdb:wait(erlfdb:get_range_startswith(Tx, Pfx)) of
         [] ->
             {ok, 0};
@@ -403,20 +413,20 @@ do_update_counter(Tx, TableId, Key, Inc) when Inc < 1 ->
             %% and sum all the counters at the same time
             {_, NCount} =
                 lists:foldl(
-                fun({K, <<OldVal:64/unsigned-little-integer>>}, waiting) when (OldVal + Inc) >= 0 ->
-                        erlfdb:wait(erlfdb:add(Tx, K, Inc)),
-                        {ok, OldVal + Inc};
-                    ({_, <<OldVal:64/unsigned-little-integer>>}, {R, IInc}) ->
-                        {R, OldVal + IInc}
-                end, {waiting, 0}, shuffle(Counters0)),
+                  fun({K, <<OldVal:64/unsigned-little-integer>>}, waiting) when (OldVal + Inc) >= 0 ->
+                          erlfdb:wait(erlfdb:add(Tx, K, Inc)),
+                          {ok, OldVal + Inc};
+                     ({_, <<OldVal:64/unsigned-little-integer>>}, {R, IInc}) ->
+                          {R, OldVal + IInc}
+                  end, {waiting, 0}, shuffle(Counters0)),
             {ok, NCount}
     end;
 do_update_counter(Tx, TableId, Key, Inc) ->
     %% Increment random counter
-    Key = encode_key(TableId,  {<<"c">>, Key, rand:uniform(?ENTRIES_PER_COUNTER)}),
+    Key = encode_key(TableId,  {?TABLE_COUNT_PFX, Key, rand:uniform(?ENTRIES_PER_COUNTER)}),
     ok = erlfdb:wait(erlfdb:add(Tx, Key, Inc)),
     %% Then sum all the counters
-    Pfx = encode_prefix(TableId,  {<<"c">>, Key, ?FDB_WC}),
+    Pfx = encode_prefix(TableId,  {?TABLE_COUNT_PFX, Key, ?FDB_WC}),
     case erlfdb:wait(erlfdb:get_range_startswith(Tx, Pfx)) of
         [] ->
             {ok, 0};

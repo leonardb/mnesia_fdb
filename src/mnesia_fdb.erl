@@ -394,8 +394,8 @@ delete(Alias, Tab, Key) ->
     ?dbg("~p delete(~p, ~p, ~p)", [self(), Alias, Tab, Key]),
     case mfdb_manager:st(Tab) of
         #st{} = St ->
-            try db_delete(St, Key)
-        catch
+            try mfdb_lib:delete(St, Key)
+            catch
                 E:M ->
                     io:format("Delete error ~p ~p", [E,M]),
                     badarg
@@ -429,7 +429,7 @@ insert(_Alias, Tab0, Obj) ->
 lookup(Alias, Tab0, Key) ->
     ?dbg("~p : lookup(~p, ~p, ~p)", [self(), Alias, Tab0, Key]),
     #st{db = Db, mtab = Tab0, table_id = TableId} = mfdb_manager:st(Tab0),
-    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Key}),
+    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PFX, Key}),
             case erlfdb:get(Db, EncKey) of
                 not_found ->
                     [];
@@ -476,9 +476,8 @@ match_delete(_Alias, Tab0, Pat) when is_tuple(Pat) ->
 first(Alias, Tab0) ->
     ?dbg("~p : first(~p, ~p)", [self(), Alias, Tab0]),
     #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
-    StartKey = mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC}),
-    EndKey = erlfdb_key:strinc(StartKey),
-    case erlfdb:get_range(Db, StartKey, EndKey, [{limit,1}]) of
+    {Start, End} = erlfdb_tuple:range({?DATA_PFX}, TableId),
+    case erlfdb:get_range(Db, Start, End, [{limit,1}]) of
         [] ->
             '$end_of_table';
         [{EncKey, _}] ->
@@ -488,8 +487,8 @@ first(Alias, Tab0) ->
 next(Alias, Tab0, Key) ->
     ?dbg("~p : next(~p, ~p, ~p)", [self(), Alias, Tab0, Key]),
     #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
-    SKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Key}),
-    EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC})),
+    SKey = mfdb_lib:encode_key(TableId, {?DATA_PFX, Key}),
+    EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC})),
     case erlfdb:get_range(Db, SKey, EKey, [{limit, 2}]) of
         [] ->
             '$end_of_table';
@@ -509,8 +508,8 @@ next(Alias, Tab0, Key) ->
 prev(Alias, Tab0, Key) ->
     ?dbg("~p : prev(~p, ~p, ~p)", [self(), Alias, Tab0, Key]),
     #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
-    SKey = mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC}),
-    EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, Key})),
+    SKey = mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC}),
+    EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PFX, Key})),
     case erlfdb:get_range(Db, SKey, EKey, [{reverse, true}, {limit, 2}]) of
         [] ->
             '$end_of_table';
@@ -530,7 +529,7 @@ prev(Alias, Tab0, Key) ->
 last(Alias, Tab0) ->
     ?dbg("~p : last(~p, ~p)", [self(), Alias, Tab0]),
     #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
-    SKey = mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC}),
+    SKey = mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC}),
     EKey = erlfdb_key:strinc(SKey),
     case erlfdb:get_range(Db, SKey, EKey, [{reverse, true}, {limit, 1}]) of
         [] ->
@@ -642,7 +641,7 @@ primary_table_range_(Guards) ->
 
 primary_table_range_([], Start, End) ->
     {replace_(Start, ?FDB_WC),
-     replace_(End, ?FDB_END)};
+     replace_(End, ?FDB_WC)};
 primary_table_range_([{2, '>=', V} | Rest], undefined, End) ->
     primary_table_range_(Rest, {gte, V}, End);
 primary_table_range_([{2, '>', V} | Rest], undefined, End) ->
@@ -749,7 +748,7 @@ idx_table_params_(Guards, Keypos, TableId) ->
 idx_table_params_([], _Keypos, TableId, Start, End, Match, Guards) ->
     ?dbg("Start: ~p~nEnd:~p~nMatch:~p~nGuards:~p~n",[Start, End, Match, Guards]),
     PfxStart = index_pfx(start, ?FDB_WC, true),
-    PfxEnd = index_pfx('end', ?FDB_END, true),
+    PfxEnd = index_pfx('end', ?FDB_WC, true),
     {replace_(Start, {fdb, mfdb_lib:encode_prefix(TableId, PfxStart)}),
      replace_(End, {fdb, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, PfxEnd))}),
      Match,
@@ -798,8 +797,7 @@ v_({{_, '$1'}}) -> 10;
 v_({{'$1', '$2'}}) -> 0; %% indicates guards will be processed
 v_({{_, '$2'}}) -> 20; %% indicates a head-bound match
 v_({_, _}) -> 1;
-v_(?FDB_WC) -> 0; %% scan from start of table
-v_(?FDB_END) -> 0; %% scan to end of table
+v_(?FDB_WC) -> 0; %% scan from start or to end of table
 v_(B) when is_binary(B) -> 1;
 v_(L) when is_list(L) ->
     %% number of guards
@@ -894,7 +892,7 @@ value_size_guard_([], _St, _Obj) ->
 value_size_guard_([undefined | Rest], #st{} = St, Obj) ->
     value_size_guard_(Rest, St, Obj);
 value_size_guard_([#idx{pos = P} | Rest], #st{table_id = TableId, attributes = Attrib} = St, {{_V,_Id}} = Idx) ->
-    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Idx}),
+    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PFX, Idx}),
     ByteSize = byte_size(EncKey),
     case ByteSize of
         X when X > ?MAX_KEY_SIZE ->
@@ -907,7 +905,7 @@ value_size_guard_([#idx{pos = P} | Rest], #st{table_id = TableId, attributes = A
     IdxVal = element(P, Obj),
     IdxId = element(2, Obj),
     Idx = {{IdxVal, IdxId}},
-    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PREFIX, Idx}),
+    EncKey = mfdb_lib:encode_key(TableId, {?DATA_PFX, Idx}),
     ByteSize = byte_size(EncKey),
     case ByteSize of
         X when X > ?MAX_KEY_SIZE ->
@@ -938,9 +936,9 @@ do_match_delete(Pat, #st{table_id = TableId, mtab = MTab} = St) ->
     IsIndex = is_index(MTab),
     Keypat = keypat(MS, TableId, IsIndex, keypos(MTab)),
     CompiledMS = ets:match_spec_compile(MS),
-    DPfx = ?DATA_PREFIX,
+    DPfx = ?DATA_PFX,
     StartKey = mfdb_lib:encode_prefix(TableId, {DPfx, Keypat}),
-    EndKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {DPfx, ?FDB_END})),
+    EndKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {DPfx, ?FDB_WC})),
     do_fold_delete_(St, StartKey, EndKey, DPfx, Keypat, CompiledMS).
 
 do_fold_delete_(#st{db = Db, table_id = TableId} = St,
@@ -1016,7 +1014,7 @@ do_indexed_select(Tab0, MS, {IdxPos, {Start, End, Match, Guard}}, AccKeys, Limit
 outer_match_fun_(OTableId, OMTab, OCompiledKeyMs, AccKeys) ->
     fun(Tx, Id, Acc0) ->
                     ?dbg("Outer match fun", []),
-                    K = mfdb_lib:encode_key(OTableId, {?DATA_PREFIX, Id}),
+                    K = mfdb_lib:encode_key(OTableId, {?DATA_PFX, Id}),
                     case erlfdb:wait(erlfdb:get(Tx, K)) of
                         not_found ->
                             %% This should only happen with a dead index
@@ -1081,14 +1079,14 @@ do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, AccKeys, Limit) when is_bo
     InTransaction = mnesia:is_transaction(),
     Keypat = case Keypat0 of
                  <<>> when IsIndex =:= true ->
-                     mfdb_lib:encode_prefix(TableId, {<<"di">>, ?FDB_WC});
+                     mfdb_lib:encode_prefix(TableId, {?DATA_INDEX_PFX, ?FDB_WC});
                  _ when IsIndex =:= false andalso (PkStart =/= undefined orelse PkEnd =/= undefined) ->
                      {range,
                          pk_to_range(TableId, start, PkStart),
                          pk_to_range(TableId, 'end', PkEnd)
                      };
                  <<>> when IsIndex =:= false ->
-                     mfdb_lib:encode_prefix(TableId, {<<"d">>, ?FDB_WC});
+                     mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC});
                  Keypat0 -> Keypat0
              end,
     CompiledMs = ets:match_spec_compile(MS),
@@ -1100,17 +1098,17 @@ do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, AccKeys, Limit) when is_bo
 
 %% ordered set tables
 pk_to_range(TableId, start, {gt, X}) ->
-    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X}))};
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PFX, X}))};
 pk_to_range(TableId, start, {gte, X}) ->
-    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X})};
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PFX, X})};
 pk_to_range(TableId, 'end', {lt, X}) ->
-    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X})};
+    {fdbr, mfdb_lib:encode_key(TableId, {?DATA_PFX, X})};
 pk_to_range(TableId, 'end', {lte, X}) ->
-    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PREFIX, X}))};
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_key(TableId, {?DATA_PFX, X}))};
 pk_to_range(TableId, start, _) ->
-    {fdbr, mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_WC})};
+    {fdbr, mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC})};
 pk_to_range(TableId, 'end', _) ->
-    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, ?FDB_END}))}.
+    {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC}))}.
 
 do_iter(_InTransaction, '$end_of_table', Limit, Acc) when Limit =:= 0 ->
     {?SORT(Acc), '$end_of_table'};
@@ -1281,35 +1279,16 @@ keypat_pfx(_, _, _, _) ->
     <<>>.
 
 index_pfx(start, V, true) ->
-    Pfx = {<<(?DATA_PREFIX)/binary, "i">>, {V, ?FDB_WC}},
+    Pfx = {<<(?DATA_PFX)/binary, "i">>, {V, ?FDB_WC}},
     ?dbg("prefix: ~p", [Pfx]),
     Pfx;
 index_pfx('end', V, true) ->
-    Pfx = {<<(?DATA_PREFIX)/binary, "i">>, {V, ?FDB_END}},
+    Pfx = {<<(?DATA_PFX)/binary, "i">>, {V, ?FDB_WC}},
     ?dbg("prefix: ~p", [Pfx]),
     Pfx;
 index_pfx(_D, V, false) ->
     %%io:format("Type: ~p D: ~p V: ~p~n", [Type, D, V]),
     V.
-
-
-%% ----------------------------------------------------------------------------
-%% Db wrappers
-%% ----------------------------------------------------------------------------
-
-return_catch(F) when is_function(F, 0) ->
-    try F()
-    catch
-        throw:badarg ->
-            ?dbg("badarg in return_catch F() run", []),
-            badarg
-    end.
-
-db_delete(#st{} = St, K) ->
-    mfdb_lib:delete(St, K).
-
-db_put(#st{} = St, K, V) ->
-    mfdb_lib:put(St, K, V).
 
 %% ----------------------------------------------------------------------------
 %% COMMON PRIVATE
@@ -1560,13 +1539,13 @@ iter_start_end_(TableId, StartKey0) ->
                     {S1k, S1} when S1k =:= fdb orelse S1k =:= fdbr ->
                         erlfdb_key:first_greater_or_equal(S1);
                     S0 ->
-                        mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, S0})
+                        mfdb_lib:encode_prefix(TableId, {?DATA_PFX, S0})
                 end,
             E = case E0 of
                     {E1k, E1} when E1k =:= fdb orelse E1k =:= fdbr ->
                         E1;
                     E0 ->
-                        erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PREFIX, E0}))
+                        erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PFX, E0}))
                 end,
             {S, E};
         StartKey0 ->

@@ -113,7 +113,7 @@ set_ttl(Tab0, TTL) when is_atom(Tab0) ->
             ok = erlfdb:set(Db, PTabKey, term_to_binary(NSt)),
             ok = reaper_start(Tab0, TableId, TTL),
             ok;
-        [#st{db = Db, table_id = TableId} = St] when TTL =:= undefined ->
+        [#st{db = Db} = St] when TTL =:= undefined ->
             %% remove TTL from table, including removing all
             %% related TTL entries for existing records
             NSt = St#st{ttl = undefined},
@@ -322,21 +322,12 @@ delete_table_(Tab0) ->
     ok.
 
 clear_index(Db, TableId) ->
-    IdxDataStart = mfdb_lib:encode_key(TableId, {<<"di">>, ?FDB_WC}),
-    IdxDataEnd = mfdb_lib:encode_key(TableId, {<<"di">>, ?FDB_END}),
-    ok = erlfdb:clear_range(Db, IdxDataStart, IdxDataEnd),
-    IdxStart = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_WC}),
-    IdxEnd = mfdb_lib:encode_key(TableId, {<<"i">>, ?FDB_END}),
-    ok = erlfdb:clear_range(Db, IdxStart, IdxEnd),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC})).
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?DATA_INDEX_PFX})),
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?INDEX_COUNT_PFX})).
 
 clear_table(Db, TableId) ->
-    ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"c">>})),
-    ok = erlfdb:clear(Db, mfdb_lib:encode_key(TableId, {<<"s">>})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC, ?FDB_WC, ?FDB_WC})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC, ?FDB_WC})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC, ?FDB_WC})),
-    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_prefix(TableId, {?FDB_WC})).
+    %% Remove all counters, data, indexes, references
+    ok = erlfdb:clear_range_startswith(Db, mfdb_lib:encode_key(TableId, {})).
 
 mk_tab_(Db, TableId, Tab, MTab, Props) ->
     Alias = proplists:get_value(alias, Props, fdb_copies),
