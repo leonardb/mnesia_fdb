@@ -34,29 +34,26 @@ put(#st{db = ?IS_DB = Db, table_id = TableId, mtab = MTab, hca_ref = HcaRef, ttl
     V = <<Size:32, V1/binary>>,
     %%Tx = erlfdb:create_transaction(Db),
     Fun = fun(Tx) ->
-                  SizeInc = case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
-                                <<"mfdb_ref", OldSize:32/integer, OldMfdbRefPartId/binary>> ->
-                                    %% Replacing entry, increment by size diff
-                                    {?DATA_PART_PFX, PartHcaVal} = erlfdb_tuple:unpack(OldMfdbRefPartId),
-                                    Start = encode_prefix(TableId, {?DATA_PART_PFX, PartHcaVal, <<"_">>, '_'}),
-                                    ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, Start)),
-                                    ((OldSize * -1) + Size);
-                                <<OldSize:32, _/binary>> ->
-                                    %% Replacing entry, increment by size diff
-                                    ((OldSize * -1) + Size);
-                                not_found ->
-                                    %% New entry, so increase count and add size
-                                    ok = tbl_count_inc(Tx, TableId, 1),
-                                    Size
-                            end,
-                  ok = tbl_size_inc(Tx, TableId, SizeInc),
-                  case Size > ?MAX_VALUE_SIZE of
-                      true ->
-                          %% Save the new parts
-                          MfdbRefPartId = save_parts(Tx, TableId, HcaRef, V),
-                          ok = erlfdb:wait(erlfdb:set(Tx, EncKey, <<?DATA_REF_PFX/binary, Size:32, MfdbRefPartId/binary>>));
-                      false ->
-                          erlfdb:wait(erlfdb:set(Tx, EncKey, V))
+                  case erlfdb:wait(erlfdb:get(Tx, EncKey)) of
+                      not_found ->
+                          %% New entry, so increase count and add size
+                          ok = tbl_count_inc(Tx, TableId, 1),
+                          ok = tbl_size_inc(Tx, TableId, Size),
+                          ok = put_(Tx, TableId, HcaRef, Size, EncKey, V);
+                      OldVal when OldVal =:= V ->
+                          %% same key/value
+                          ok;
+                      <<"mfdb_ref", OldSize:32/integer, OldMfdbRefPartId/binary>> ->
+                          %% Replacing entry, increment by size diff
+                          {?DATA_PART_PFX, PartHcaVal} = erlfdb_tuple:unpack(OldMfdbRefPartId),
+                          Start = encode_prefix(TableId, {?DATA_PART_PFX, PartHcaVal, <<"_">>, '_'}),
+                          ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, Start)),
+                          ok = tbl_size_inc(Tx, TableId, ((OldSize * -1) + Size)),
+                          ok = put_(Tx, TableId, HcaRef, Size, EncKey, V);
+                      <<OldSize:32, _/binary>> ->
+                          %% Exists, but value has changed
+                          ok = tbl_size_inc(Tx, TableId, ((OldSize * -1) + Size)),
+                          ok = put_(Tx, TableId, HcaRef, Size, EncKey, V)
                   end,
                   put_ttl(Tx, TableId, TTL, K)
           end,
@@ -74,6 +71,16 @@ put(#st{db = ?IS_DB = Db, mtab = {_, index, {KeyPos, _}}, index = Indexes}, {V0,
             ok = erlfdb:transactional(Db, IdxFun)
     end,
     ok.
+
+put_(Tx, TableId, HcaRef, Size, EncKey, V) ->
+    case Size > ?MAX_VALUE_SIZE of
+        true ->
+            %% Save the new parts
+            MfdbRefPartId = save_parts(Tx, TableId, HcaRef, V),
+            ok = erlfdb:wait(erlfdb:set(Tx, EncKey, <<?DATA_REF_PFX/binary, Size:32, MfdbRefPartId/binary>>));
+        false ->
+            erlfdb:wait(erlfdb:set(Tx, EncKey, V))
+    end.
 
 put_ttl(_Tx, _TableId, undefined, _Key) ->
     ok;
@@ -104,13 +111,13 @@ ttl_remove_(Tx, TableId, _TTL, Key) ->
 
 add_data_indexes_(Tx, K, Val, #idx{table_id = TableId}) ->
     ok = idx_count_inc(Tx, TableId, Val, 1),
-    ?dbg("Add data index ~p", [{?DATA_INDEX_PFX, {Val, K}}]),
-    ok = erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {?DATA_INDEX_PFX, {Val, K}}), <<>>)).
+    ?dbg("Add data index ~p", [{?DATA_INDEX_PFX, Val, K}]),
+    ok = erlfdb:wait(erlfdb:set(Tx, encode_key(TableId, {?DATA_INDEX_PFX, Val, K}), <<>>)).
 
 remove_data_indexes_(Tx, Val, Key, #idx{table_id = TableId}) ->
     ok = idx_count_inc(Tx, TableId, Val, -1),
-    ?dbg("Remove data index ~p", [{?DATA_INDEX_PFX, {Val, Key}}]),
-    ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, encode_prefix(TableId, {?DATA_INDEX_PFX, {Val, Key}}))).
+    ?dbg("Remove data index ~p", [{?DATA_INDEX_PFX, Val, Key}]),
+    ok = erlfdb:wait(erlfdb:clear_range_startswith(Tx, encode_prefix(TableId, {?DATA_INDEX_PFX, Val, Key}))).
 
 parts_value_(MfdbRefPartId, TableId, Tx) ->
     {?DATA_PART_PFX, PartHcaVal} = erlfdb_tuple:unpack(MfdbRefPartId),
@@ -233,7 +240,7 @@ bin_join_parts_([{_, Bin} | Rest], Acc) ->
 
 decode_key(TableId, EncKey) ->
     case erlfdb_tuple:unpack(EncKey, TableId) of
-        {?DATA_INDEX_PFX, {Val, Id}} ->
+        {?DATA_INDEX_PFX, Val, Id} ->
             %% data index reference key
             {idx, {{Val, Id}}};
         {?DATA_PFX, Key} ->
@@ -279,6 +286,8 @@ mk_prefix_([Item | Rest], Acc) ->
 tbl_count_key(TableId) ->
     encode_key(TableId, {?TABLE_COUNT_PFX, rand:uniform(?ENTRIES_PER_COUNTER)}).
 
+tbl_count_inc(_Tx, _TableId, 0) ->
+    ok;
 tbl_count_inc(Tx, TableId, Inc) when Inc < 1 ->
     %% decrement
     Pfx = encode_prefix(TableId, {?TABLE_COUNT_PFX, ?FDB_WC}),
@@ -306,6 +315,8 @@ shuffle(List) ->
 tbl_size_key(TableId) ->
     encode_key(TableId, {?TABLE_SIZE_PFX, rand:uniform(?ENTRIES_PER_COUNTER)}).
 
+tbl_size_inc(_Tx, _TableId, 0) ->
+    ok;
 tbl_size_inc(Tx, TableId, Inc) when Inc < 1 ->
     %% decrement
     Pfx = encode_prefix(TableId, {?TABLE_SIZE_PFX, ?FDB_WC}),

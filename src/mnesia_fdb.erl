@@ -420,7 +420,7 @@ insert(_Alias, Tab0, Obj) ->
     try mfdb_lib:put(St, Key, Val)
     catch
         E:M ->
-            io:format("Insert error: ~p ~p~n", [E,M]),
+            io:format("Insert error: ~p, ~p ~p~n", [Obj, E,M]),
             badarg
     end.
 
@@ -642,6 +642,8 @@ primary_table_range_(Guards) ->
 primary_table_range_([], Start, End) ->
     {replace_(Start, ?FDB_WC),
      replace_(End, ?FDB_WC)};
+primary_table_range_([{2, '=:=', V} | _Rest], undefined, _End) ->
+    primary_table_range_([], {gte, V}, {lte, V});
 primary_table_range_([{2, '>=', V} | Rest], undefined, End) ->
     primary_table_range_(Rest, {gte, V}, End);
 primary_table_range_([{2, '>', V} | Rest], undefined, End) ->
@@ -747,16 +749,17 @@ idx_table_params_(Guards, Keypos, TableId) ->
 
 idx_table_params_([], _Keypos, TableId, Start, End, Match, Guards) ->
     ?dbg("Start: ~p~nEnd:~p~nMatch:~p~nGuards:~p~n",[Start, End, Match, Guards]),
-    PfxStart = index_pfx(start, ?FDB_WC, true),
-    PfxEnd = index_pfx('end', ?FDB_WC, true),
+    PfxStart = {?DATA_INDEX_PFX},
+    PfxEnd = {?DATA_INDEX_PFX},
+    ?dbg("PxfStart: ~p vs ~p~nPfxEnd: ~p vs ~p~n",[Start, PfxStart, End, PfxEnd]),
     {replace_(Start, {fdb, mfdb_lib:encode_prefix(TableId, PfxStart)}),
      replace_(End, {fdb, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, PfxEnd))}),
      Match,
      Guards};
 idx_table_params_([{Keypos, '=:=', Val} | Rest], Keypos, TableId, _Start, _End, _Match, Guards) ->
     Match = {{Val, '$2'}},
-    PfxStart = index_pfx(start, Val, true),
-    PfxEnd = index_pfx('end', Val, true),
+    PfxStart = {?DATA_INDEX_PFX, Val},
+    PfxEnd = {?DATA_INDEX_PFX, Val},
     ?dbg("Setting Start [~p]: mfdb_lib:encode_prefix(~p, ~p)~n",
          [Keypos, TableId, PfxStart]),
     Start = {fdbr, mfdb_lib:encode_prefix(TableId, PfxStart)},
@@ -767,7 +770,7 @@ idx_table_params_([{Keypos, '=:=', Val} | Rest], Keypos, TableId, _Start, _End, 
 idx_table_params_([{Keypos, Comp, Val} | Rest], Keypos, TableId, Start, End, Match, Guards)
   when Comp =:= '>=' orelse Comp =:= '>' ->
     NGuards = [{Comp, '$1', Val} | Guards],
-    PfxStart = index_pfx(start, Val, true),
+    PfxStart = {?DATA_INDEX_PFX, Val},
     ?dbg("Setting Start [~p]: mfdb_lib:encode_prefix(~p, ~p)~n",
          [Keypos, TableId, PfxStart]),
     NStart0 = {fdbr, mfdb_lib:encode_prefix(TableId, PfxStart)},
@@ -776,7 +779,7 @@ idx_table_params_([{Keypos, Comp, Val} | Rest], Keypos, TableId, Start, End, Mat
 idx_table_params_([{Keypos, Comp, Val} | Rest], Keypos, TableId, Start, End, Match, Guards)
   when Comp =:= '=<' orelse Comp =:= '<' ->
     NGuards = [{Comp, '$1', Val} | Guards],
-    PfxEnd = index_pfx('end', Val, true),
+    PfxEnd = {?DATA_INDEX_PFX, Val},
     ?dbg("Setting End [~p]: erlfdb_key:strinc(mfdb_lib:encode_prefix(~p, ~p))~n",
          [Keypos, TableId, PfxEnd]),
     NEnd0 = {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, PfxEnd))},
@@ -1092,7 +1095,6 @@ do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, AccKeys, Limit) when is_bo
     CompiledMs = ets:match_spec_compile(MS),
     DataFun = undefined,
     InAcc = [],
-    ?dbg("KeyPat: ~p~n", [Keypat]),
     Iter = iter_(Db, TableId, Tab, MTab, Keypat, AccKeys, KeysOnly, CompiledMs, DataFun, InAcc, Limit),
     do_iter(InTransaction, Iter, Limit, []).
 
@@ -1266,12 +1268,10 @@ common_prefix(_, _) ->
     <<>>.
 
 keypat_pfx({{HeadPat},_Gs,_}, TableId, IsIndex, KeyPos) when is_tuple(HeadPat) ->
-    ?dbg("element(~p, ~p)", [KeyPos, HeadPat]),
     KP      = element(KeyPos, HeadPat),
     KeyPat = index_pfx('start', KP, IsIndex),
     mfdb_lib:encode_prefix(TableId, KeyPat);
 keypat_pfx({HeadPat,_Gs,_}, TableId, IsIndex, KeyPos) when is_tuple(HeadPat) ->
-    ?dbg("element(~p, ~p)", [KeyPos, HeadPat]),
     KP      = element(KeyPos, HeadPat),
     KeyPat = index_pfx('start', KP, IsIndex),
     mfdb_lib:encode_prefix(TableId, KeyPat);
@@ -1279,16 +1279,14 @@ keypat_pfx(_, _, _, _) ->
     <<>>.
 
 index_pfx(start, V, true) ->
-    Pfx = {<<(?DATA_PFX)/binary, "i">>, {V, ?FDB_WC}},
-    ?dbg("prefix: ~p", [Pfx]),
+    Pfx = {?DATA_INDEX_PFX, V, ?FDB_WC},
     Pfx;
 index_pfx('end', V, true) ->
-    Pfx = {<<(?DATA_PFX)/binary, "i">>, {V, ?FDB_WC}},
-    ?dbg("prefix: ~p", [Pfx]),
+    Pfx = {?DATA_INDEX_PFX, V, ?FDB_WC},
     Pfx;
 index_pfx(_D, V, false) ->
     %%io:format("Type: ~p D: ~p V: ~p~n", [Type, D, V]),
-    V.
+    {?DATA_PFX, V}.
 
 %% ----------------------------------------------------------------------------
 %% COMMON PRIVATE
