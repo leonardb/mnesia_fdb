@@ -489,7 +489,12 @@ next(Alias, Tab0, Key) ->
     #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
     SKey = mfdb_lib:encode_key(TableId, {?DATA_PFX, Key}),
     EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC})),
-    case erlfdb:get_range(Db, SKey, EKey, [{limit, 2}]) of
+    case erlfdb:get_range(
+           Db,
+           erlfdb_key:first_greater_than(SKey),
+           EKey,
+           [{limit, 1}])
+    of
         [] ->
             '$end_of_table';
         [{K,_}] ->
@@ -508,9 +513,9 @@ next(Alias, Tab0, Key) ->
 prev(Alias, Tab0, Key) ->
     ?dbg("~p : prev(~p, ~p, ~p)", [self(), Alias, Tab0, Key]),
     #st{db = Db, table_id = TableId} = mfdb_manager:st(Tab0),
-    SKey = mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC}),
-    EKey = erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PFX, Key})),
-    case erlfdb:get_range(Db, SKey, EKey, [{reverse, true}, {limit, 2}]) of
+    SKey = mfdb_lib:encode_prefix(TableId,{?DATA_PFX, ?FDB_WC}),
+    EKey = mfdb_lib:encode_key(TableId,{?DATA_PFX, Key}),
+    case erlfdb:get_range(Db, SKey, EKey,[{reverse,true}, {limit, 1}]) of
         [] ->
             '$end_of_table';
         [{K,_}] ->
