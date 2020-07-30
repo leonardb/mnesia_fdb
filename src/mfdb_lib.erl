@@ -19,7 +19,7 @@
          table_data_size/1,
          update_counter/4,
          unixtime/0,
-         sort/1]).
+         sort/2]).
 
 -include("mfdb.hrl").
 -define(SECONDS_TO_EPOCH, (719528*24*3600)).
@@ -455,9 +455,9 @@ datetime_to_unix({{Y,Mo,D},{H,Mi,S}}) ->
     calendar:datetime_to_gregorian_seconds(
       {{Y,Mo,D},{H,Mi,round(S)}}) - ?SECONDS_TO_EPOCH.
 
-sort([] = L) ->
+sort(_RecName, [] = L) ->
     L;
-sort([T | _] = L) when is_tuple(T) andalso is_atom(element(1, T)) ->
+sort(RecName, [T | _] = L) when is_tuple(T) andalso element(1, T) =:= RecName ->
     lists:keysort(2, L);
-sort(L) ->
+sort(_RecName, L) ->
     lists:sort(L).

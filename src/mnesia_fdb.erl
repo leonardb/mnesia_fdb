@@ -569,12 +569,12 @@ select(Alias, Tab, Ms) ->
 
 select(Alias, Tab0, Ms0, Limit) when is_integer(Limit) ->
     ?dbg("~p : select(~p, ~p, ~p, ~p)", [self(),Alias, Tab0, Ms0, Limit]),
-    #st{db = Db, table_id = TableId, tab = Tab, mtab = MTab, index = Indexes0} = St = mfdb_manager:st(Tab0),
+    #st{db = Db, table_id = TableId, tab = Tab, mtab = MTab, index = Indexes0, record_name = RecName} = St = mfdb_manager:st(Tab0),
     case Tab0 of
         {_, index, _Idx} ->
             ?dbg("Selecting from index: ~p~n", [_Idx]),
             #st{db = Db, table_id = TableId, tab = Tab, mtab = MTab} = mfdb_manager:st(Tab0),
-            do_select(Db, TableId, Tab, MTab, Ms0, undefined, undefined, Limit);
+            do_select(Db, RecName, TableId, Tab, MTab, Ms0, undefined, undefined, Limit);
         _ ->
             {Guards, Binds, Ms} =
                 case Ms0 of
@@ -602,7 +602,7 @@ select(Alias, Tab0, Ms0, Limit) when is_integer(Limit) ->
                     do_indexed_select(Tab0, Ms, IdxParams, false, Limit);
                 no_index ->
                     ?dbg("no_index: using MS ~p~n", [Ms]),
-                    do_select(Db, TableId, Tab, MTab, Ms, PkStart, PkEnd, Limit)
+                    do_select(Db, RecName, TableId, Tab, MTab, Ms, PkStart, PkEnd, Limit)
             end
     end.
 
@@ -1004,7 +1004,7 @@ do_fold_delete2_(#st{table_id = TableId, mtab = MTab} = St, [{EncKey, EncV} | Re
 %% and wrapping in an outer select function to allow matching other guards
 %% @todo: use multiple indexes, possibly with a parallel query to get all ids, and use intersection for final id list
 do_indexed_select(Tab0, MS, {IdxPos, {Start, End, Match, Guard}}, AccKeys, Limit) when is_boolean(AccKeys) ->
-    #st{db = Db, table_id = OTableId, mtab = OMTab, index = Indexes} = mfdb_manager:st(Tab0),
+    #st{db = Db, table_id = OTableId, mtab = OMTab, index = Indexes, record_name = RecName} = mfdb_manager:st(Tab0),
     #idx{table_id = ITableId, tab = ITab, mtab = IMTab} = element(IdxPos, Indexes),
     KeyMs = [{Match, Guard, ['$_']}],
     OKeysOnly = needs_key_only(MS),
@@ -1017,7 +1017,7 @@ do_indexed_select(Tab0, MS, {IdxPos, {Start, End, Match, Guard}}, AccKeys, Limit
     OAcc = [],
     IRange = {range, Start, End},
     Iter = iter_(Db, ITableId, ITab, IMTab, IRange, AccKeys, OKeysOnly, undefined, DataFun, OAcc, Limit),
-    do_iter(InTransaction, Iter, Limit, []).
+    do_iter(RecName, InTransaction, Iter, Limit, []).
 
 outer_match_fun_(OTableId, OMTab, OCompiledKeyMs, AccKeys) ->
     fun(Tx, Id, Acc0) ->
@@ -1077,10 +1077,10 @@ is_index(MTab) when is_atom(MTab) ->
 is_index(_MTab) ->
     true.
 
-do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, Limit) ->
-    do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, false, Limit).
+do_select(Db, RecName, TableId, Tab, MTab, MS, PkStart, PkEnd, Limit) ->
+    do_select(Db, RecName, TableId, Tab, MTab, MS, PkStart, PkEnd, false, Limit).
 
-do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, AccKeys, Limit) when is_boolean(AccKeys) ->
+do_select(Db, RecName, TableId, Tab, MTab, MS, PkStart, PkEnd, AccKeys, Limit) when is_boolean(AccKeys) ->
     IsIndex = is_index(MTab),
     Keypat0 = keypat(MS, TableId, IsIndex, 2),
     KeysOnly = needs_key_only(MS),
@@ -1101,7 +1101,7 @@ do_select(Db, TableId, Tab, MTab, MS, PkStart, PkEnd, AccKeys, Limit) when is_bo
     DataFun = undefined,
     InAcc = [],
     Iter = iter_(Db, TableId, Tab, MTab, Keypat, AccKeys, KeysOnly, CompiledMs, DataFun, InAcc, Limit),
-    do_iter(InTransaction, Iter, Limit, []).
+    do_iter(RecName, InTransaction, Iter, Limit, []).
 
 %% ordered set tables
 pk_to_range(TableId, start, {gt, X}) ->
@@ -1117,36 +1117,36 @@ pk_to_range(TableId, start, _) ->
 pk_to_range(TableId, 'end', _) ->
     {fdbr, erlfdb_key:strinc(mfdb_lib:encode_prefix(TableId, {?DATA_PFX, ?FDB_WC}))}.
 
-do_iter(_InTransaction, '$end_of_table', Limit, Acc) when Limit =:= 0 ->
-    {?SORT(Acc), '$end_of_table'};
-do_iter(_InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit =:= 0 ->
-    {?SORT(lists:append(Acc, Data)), '$end_of_table'};
-do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit =:= 0 andalso is_function(Iter) ->
-    NAcc = ?SORT(lists:append(Acc, Data)),
+do_iter(RecName, _InTransaction, '$end_of_table', Limit, Acc) when Limit =:= 0 ->
+    {?SORT(RecName, Acc), '$end_of_table'};
+do_iter(RecName, _InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit =:= 0 ->
+    {?SORT(RecName, lists:append(Acc, Data)), '$end_of_table'};
+do_iter(RecName, _InTransaction, {Data, Iter}, Limit, Acc) when Limit =:= 0 andalso is_function(Iter) ->
+    NAcc = ?SORT(RecName, lists:append(Acc, Data)),
     case Iter() of
         '$end_of_table' ->
             NAcc;
         {_, '$end_of_table'} = NIter ->
-            do_iter(_InTransaction, NIter, Limit, NAcc);
+            do_iter(RecName, _InTransaction, NIter, Limit, NAcc);
         {_, ?IS_ITERATOR} = NIter ->
-            do_iter(_InTransaction, NIter, Limit, NAcc)
+            do_iter(RecName, _InTransaction, NIter, Limit, NAcc)
     end;
-do_iter(InTransaction, '$end_of_table', Limit, Acc) when Limit > 0 ->
+do_iter(RecName, InTransaction, '$end_of_table', Limit, Acc) when Limit > 0 ->
     case InTransaction of
         true ->
-            {?SORT(Acc), '$end_of_table'};
+            {?SORT(RecName, Acc), '$end_of_table'};
         false ->
             Acc
     end;
-do_iter(InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit > 0 ->
+do_iter(RecName, InTransaction, {Data, '$end_of_table'}, Limit, Acc) when Limit > 0 ->
     case InTransaction of
         true ->
-            {?SORT(lists:append(Acc, Data)), '$end_of_table'};
+            {?SORT(RecName, lists:append(Acc, Data)), '$end_of_table'};
         false ->
             lists:append(Acc, Data)
     end;
-do_iter(_InTransaction, {Data, Iter}, Limit, Acc) when Limit > 0 andalso is_function(Iter) ->
-    NAcc = ?SORT(lists:append(Acc, Data)),
+do_iter(RecName, _InTransaction, {Data, Iter}, Limit, Acc) when Limit > 0 andalso is_function(Iter) ->
+    NAcc = ?SORT(RecName, lists:append(Acc, Data)),
     {NAcc, Iter}.
 
 needs_key_only([{HP,_,Body}]) ->
