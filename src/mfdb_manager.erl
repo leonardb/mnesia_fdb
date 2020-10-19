@@ -242,7 +242,8 @@ code_change(_, S, _) -> {ok, S}.
 init_connection_() ->
     case application:get_all_env(mnesia_fdb) of
         [] ->
-            {error, missing_mnesia_fdb_settings};
+            lager:warning("MnesiaFdb not configured. missing_mnesia_fdb_settings"),
+            ok;
         Settings ->
             Conn = #conn{
                       cluster       = proplists:get_value(cluster, Settings),
