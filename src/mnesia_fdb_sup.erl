@@ -41,4 +41,9 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    {ok, { {one_for_one, 5, 10}, [?CHILD(mfdb_manager, worker)]} }.
+    case application:get_env(mnesia_fdb, cluster, undefined) of
+        undefined ->
+            {ok, { {one_for_one, 5, 10}, []} };
+        _ ->
+            {ok, { {one_for_one, 5, 10}, [?CHILD(mfdb_manager, worker)]} }
+    end.
