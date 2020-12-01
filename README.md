@@ -1,5 +1,10 @@
 # mnesia_fdb
 
+ARCHIVED - Superceded by https://github.com/leonardb/mfdb
+
+Due to issues with the way mnesia manages tables etc it made more sense to build a mnesia-like feature set over FDB than to use it as a backend.
+
+
 A FoundationDB backend for Mnesia.
 
 **We're looking for contributors.**
